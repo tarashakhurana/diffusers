@@ -486,7 +486,7 @@ class OccfusionDataset(Dataset):
 
             if self.plucker_coords:
                 K_beforescale = self.intrinsics[ref_index - i]
-                K = K_beforescale.detach().clone()
+                K = K_beforescale.clone()
                 # account for the image resizing operation
                 K[0] *= scale
                 K[1] *= scale
@@ -745,6 +745,7 @@ def main(args):
         offset=args.offset,
         normalization_factor=args.normalization_factor,
         plucker_coords=args.train_with_plucker_coords,
+        use_harmonic=False,
         visualize=False
     )
 
