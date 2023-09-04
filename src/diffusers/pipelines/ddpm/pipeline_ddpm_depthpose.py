@@ -22,7 +22,7 @@ from ...utils import randn_tensor
 from ..pipeline_utils import DiffusionPipeline, ImagePipelineOutput
 
 
-class DDPMInpaintingPipeline(DiffusionPipeline):
+class DDPMDepthPoseInpaintingPipeline(DiffusionPipeline):
     r"""
     This model inherits from [`DiffusionPipeline`]. Check the superclass documentation for the generic methods the
     library implements for all the pipelines (such as downloading or saving, running on a particular device, etc.)
@@ -51,6 +51,7 @@ class DDPMInpaintingPipeline(DiffusionPipeline):
         num_inference_steps: int = 1000,
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
+        user_num_masks=None,
     ) -> Union[ImagePipelineOutput, Tuple]:
         r"""
         Args:
@@ -136,11 +137,14 @@ class DDPMInpaintingPipeline(DiffusionPipeline):
                 num_masks = num_masks.numpy()[0]
                 if self.masking_strategy == "random-half":
                     num_masks = self.n_input
+                if user_num_masks is not None:
+                    args.num_masks = user_num_masks
                 time_indices = torch.from_numpy(
                     np.random.choice(self.n_input + self.n_output, size=(num_masks, ), replace=False)
                 )
                 if self.masking_strategy == "half":
                     time_indices = torch.arange(self.n_input, self.n_input + self.n_output, 1)
+                time_indices_unmasked = torch.Tensor([i for i in range(self.n_output + self.n_input) if i not in time_indices])
                 mask_images = torch.zeros_like(clean_images[:, :, 0, :, :])  # 4d
                 mask_images[:, time_indices, ...] = torch.ones_like(clean_images[:, time_indices, 0, ...])
                 clean_depths_masked = clean_depths * (1 - mask_images)
@@ -167,4 +171,4 @@ class DDPMInpaintingPipeline(DiffusionPipeline):
         if not return_dict:
             return (image,)
 
-        return ImagePipelineOutput(images=image)
+        return ImagePipelineOutput(images=(image, time_indices_unmasked))

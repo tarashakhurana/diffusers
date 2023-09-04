@@ -20,7 +20,7 @@ else:
     from .consistency_models import ConsistencyModelPipeline
     from .dance_diffusion import DanceDiffusionPipeline
     from .ddim import DDIMPipeline
-    from .ddpm import DDPMPipeline, DDPMReconstructionPipeline, DDPMInpaintingPipeline, DDPM4DVoxelInpaintingPipeline
+    from .ddpm import DDPMPipeline, DDPMReconstructionPipeline, DDPMDepthPoseInpaintingPipeline, DDPMInpaintingPipeline, DDPM4DVoxelInpaintingPipeline
     from .dit import DiTPipeline
     from .latent_diffusion import LDMSuperResolutionPipeline
     from .latent_diffusion_uncond import LDMPipeline

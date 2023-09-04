@@ -4,12 +4,13 @@ import inspect
 import argparse
 import numpy as np
 from PIL import Image
-from prettytable import PrettyTable
 from torchvision import transforms
-from diffusers import DiffusionPipeline, DDPMPipeline, DDPMInpaintingPipeline, DDPMReconstructionPipeline
+from diffusers import DDPMPipeline, DDPMDepthPoseInpaintingPipeline, DDPMInpaintingPipeline, DDPMReconstructionPipeline
 from diffusers import DPMSolverMultistepScheduler, UNet2DModel, DDPMScheduler, DDPMConditioningScheduler
+from matplotlib import pyplot as plt
 
-from data import TAODepthDataset
+from data import OccfusionDataset
+from utils import write_pointcloud
 
 
 def compute_scale_and_shift(prediction, target, mask):
@@ -34,9 +35,23 @@ def collate_fn(examples):
     inputs = torch.stack([example["input"] for example in examples])
     inputs = inputs.to(memory_format=torch.contiguous_format).float()
 
+    ray_origin = torch.stack([example["ray_origin"] for example in examples])
+    ray_origin = ray_origin.to(memory_format=torch.contiguous_format).float()
+
+    ray_direction = torch.stack([example["ray_direction"] for example in examples])
+    ray_direction = ray_direction.to(memory_format=torch.contiguous_format).float()
+
     return {
         "input": inputs,
+        "ray_origin": ray_origin,
+        "ray_direction": ray_direction
     }
+
+
+def make_gif(frames, save_path, duration):
+    frame_one = frames[0]
+    frame_one.save(save_path, format="GIF", append_images=frames, save_all=True, duration=duration, loop=0)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
@@ -51,22 +66,38 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--dataset_config_name",
+        "--model_dir",
         type=str,
         default=None,
-        help="The config of the Dataset, leave as None if there's only one config.",
+        help=(
+            "Path to saved checkpoints"
+        ),
     )
     parser.add_argument(
-        "--model_config_name_or_path",
+        "--eval_data_dir",
         type=str,
         default=None,
-        help="The config of the UNet model to train, leave as None to use standard DDPM configuration.",
+        help=(
+            "Path to the eval data directory"
+        ),
+    )
+    parser.add_argument(
+        "--eval_batch_size",
+        type=int,
+        default=8,
+        help="The batch size to use for evaluation.",
     )
     parser.add_argument(
         "--out_channels",
         type=int,
         default=3,
         help="Output channels in the UNet.",
+    )
+    parser.add_argument(
+        "--checkpoint_number",
+        type=int,
+        default=2500,
+        help="The iteration number of the checkpoint to load from the model_dir.",
     )
     parser.add_argument(
         "--in_channels",
@@ -87,35 +118,20 @@ def parse_args():
         help="Number of frames in the original video after which a frame should be picked.",
     )
     parser.add_argument(
-        "--train_data_dir",
-        type=str,
-        default=None,
-        help=(
-            "A folder containing the training data. Folder contents must follow the structure described in"
-            " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
-            " must exist to provide the captions for the images."
-        ),
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="ddpm-model-64",
-        help="The output directory where the model predictions and checkpoints will be written.",
-    )
-    parser.add_argument("--overwrite_output_dir", action="store_true")
-    parser.add_argument(
-        "--cache_dir",
-        type=str,
-        default=None,
-        help="The directory where the downloaded models and datasets will be stored.",
-    )
-    parser.add_argument(
         "--resolution",
         type=int,
         default=256,
         help=(
             "The resolution for input images, all the images in the train/validation dataset will be resized to this"
             " resolution"
+        ),
+    )
+    parser.add_argument(
+        "--normalization_factor",
+        type=float,
+        default=20400.0,
+        help=(
+            "Factor to divide the input depth images by"
         ),
     )
     parser.add_argument(
@@ -128,16 +144,34 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--visualize_2d",
+        default=False,
+        action="store_true",
+        help=(
+            "If you want the 2D visualization of the depth video."
+        ),
+    )
+    parser.add_argument(
+        "--visualize_3d",
+        default=False,
+        action="store_true",
+        help=(
+            "If you want the 3D visualization of the depth video."
+        ),
+    )
+    parser.add_argument(
+        "--train_with_plucker_coords",
+        default=False,
+        action="store_true",
+        help=(
+            "Whether to train with Plucker coordinates or not."
+        ),
+    )
+    parser.add_argument(
         "--random_flip",
         default=False,
         action="store_true",
         help="whether to randomly flip images horizontally",
-    )
-    parser.add_argument(
-        "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
-    )
-    parser.add_argument(
-        "--eval_batch_size", type=int, default=16, help="The number of images to generate for evaluation."
     )
     parser.add_argument(
         "--dataloader_num_workers",
@@ -155,6 +189,19 @@ def parse_args():
         choices=["epsilon", "sample"],
         help="Whether the model should predict the 'epsilon'/noise error or directly the reconstructed image 'x0'.",
     )
+    parser.add_argument(
+        "--masking_strategy",
+        type=str,
+        default="random",
+        choices=["all", "none", "random", "random-half", "random"],
+    )
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        default="depthpose",
+        choices=["reconstruction", "inpainting", "depthpose"],
+        help="Whether the model should predict the 'epsilon'/noise error or directly the reconstructed image 'x0'.",
+    )
     parser.add_argument("--ddpm_num_steps", type=int, default=1000)
     parser.add_argument("--ddpm_num_inference_steps", type=int, default=1000)
     parser.add_argument("--ddpm_beta_schedule", type=str, default="linear")
@@ -168,28 +215,29 @@ def parse_args():
 
     return args
 
+
 def main(args):
     # Initialize the UNet2D
-    folder_name = "/compute/trinity-1-38/tkhurana/diffusers-runs/logs/ddpm-ema-unconditional-depthvideo-64-8frames"
-    # folder_name = "/compute/trinity-1-38/tkhurana/diffusers-runs/logs/ddpm-ema-inpainting-depthvideo-64-8frames-concat-imagemaskedimagemask/"
-    reconstruction_guidance = True
-    inpainting = False
-    prediction_type = "epsilon"
-    Scheduler = DDPMScheduler # DDPMConditioningScheduler
-    # unet = UNet2DModel.from_pretrained(f"{folder_name}/checkpoint-142500/unet_ema")
-    unet = UNet2DModel.from_pretrained(f"{folder_name}/checkpoint-31500/unet_ema")
+    Scheduler = DDPMScheduler  # DDPMConditioningScheduler
+    unet = UNet2DModel.from_pretrained(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/unet_ema")
 
-    dataset = TAODepthDataset(
-        instance_data_root=args.train_data_dir,
+    dataset = OccfusionDataset(
+        instance_data_root=args.eval_data_dir,
         size=args.resolution,
         center_crop=args.center_crop,
         num_images=args.num_images,
-        offset=args.offset
+        offset=args.offset,
+        normalization_factor=args.normalization_factor,
+        plucker_coords=args.train_with_plucker_coords,
+        use_harmonic=False,
+        visualize=False
     )
 
-    train_dataloader = torch.utils.data.DataLoader(
+    assert args.eval_batch_size == 1, "eval batch size must be 1"
+
+    eval_dataloader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=args.train_batch_size,
+        batch_size=args.eval_batch_size,
         shuffle=True,
         collate_fn=collate_fn,
         num_workers=args.dataloader_num_workers,
@@ -202,33 +250,39 @@ def main(args):
         noise_scheduler = Scheduler(
             num_train_timesteps=1000,
             beta_schedule="linear",
-            prediction_type=prediction_type,
+            prediction_type=args.prediction_type,
         )
     else:
         noise_scheduler = Scheduler(num_train_timesteps=1000, beta_schedule="linear")
 
     # noise_scheduler = DPMSolverMultistepScheduler(num_train_timesteps=1000, beta_schedule="linear")
-    if reconstruction_guidance:
+    if args.model_type == "reconstruction":
         pipeline = DDPMReconstructionPipeline(unet=unet, scheduler=noise_scheduler)
-    elif inpainting:
+    elif args.model_type == "inpainting":
         pipeline = DDPMInpaintingPipeline(unet=unet, scheduler=noise_scheduler)
+    elif args.model_type == "depthpose":
+        kwargs = {}
+        kwargs["n_input"] = args.n_input
+        kwargs["n_output"] = args.n_output
+        kwargs["masking_strategy"] = args.masking_strategy
+        kwargs["train_with_plucker_coords"] = args.train_with_plucker_coords
+        pipeline = DDPMDepthPoseInpaintingPipeline(unet=unet, scheduler=noise_scheduler, kwargs=kwargs)
 
     generator = torch.Generator(device=pipeline.device).manual_seed(0)
     # run pipeline in inference (sample random noise and denoise)
 
-    top1_metric, top3_metric, top5_metric = 0, 0, 0
-    top1_inv_metric, top3_inv_metric, top5_inv_metric = 0, 0, 0
     count = 0
 
-    headers = ['Top1', 'Top1 (inv)', 'Top3', 'Top3 (inv)', 'Top5', 'Top5 (inv)']
-
-    for b, batch in enumerate(train_dataloader):
+    for b, batch in enumerate(eval_dataloader):
         data_point = batch["input"]
+        ray_origin = batch["ray_origin"]
+        ray_direction = batch["ray_direction"]
+
         total_frames = data_point.shape[1]
         past_frames = torch.stack([data_point[0, :int(total_frames / 2), ...]] * 5)
         future_frames = torch.stack([data_point[0, int(total_frames / 2):, ...]] * 5)
 
-        if reconstruction_guidance:
+        if args.model_type == "reconstruction":
             prediction = pipeline(
                     batch_size=5,
                     num_inference_steps=40,
@@ -236,22 +290,36 @@ def main(args):
                     recon_scale=10,
                     conditioning=past_frames,
                     output_type="numpy").images
-        elif inpainting:
+        elif args.model_type == "inpainting":
             prediction = pipeline(
                     inpainting_image=past_frames,
-                    # generator=generator,
                     batch_size=5,
                     num_inference_steps=40,
                     output_type="numpy").images
+        elif args.model_type == "depthpose":
+            prediction, unmasked_indices = pipeline(
+                    inpainting_image=past_frames,
+                    batch_size=1,
+                    num_inference_steps=40,
+                    output_type="numpy",
+                    num_masks=5).images
 
-        # both methods output all the past and future frames, so separate these
+        masked_indices = np.array([i for i in range(args.n_input + args.n_output) if i not in unmasked_indices.tolist()])
         prediction = torch.from_numpy(prediction).permute(0, 3, 1, 2)
-        prediction = prediction[:, int(total_frames / 2):, ...]
 
         count += 1
 
-        # instead of computing the metrics here, we want to visualize the outputs
-
+        colored_images = []
+        if args.visualize_2d:
+            for framenumber in range(prediction.shape[1]):
+                if framenumber in masked_indices:
+                    cmap = plt.cmap('inferno')
+                else:
+                    cmap = plt.cmap('gray')
+                colored_image = cmap(np.array(prediction[0, framenumber, ...]) / 255.0)
+                colored_images.append((colored_image * 255).astype(np.uint8))
+            os.makedirs(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals", exist_ok=True)
+            make_gif(colored_images, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals/2d_{count}.gif", duration=100)
 
 
 if __name__ == "__main__":

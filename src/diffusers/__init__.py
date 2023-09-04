@@ -75,6 +75,7 @@ else:
         DDPMPipeline,
         DDPMReconstructionPipeline,
         DDPMInpaintingPipeline,
+        DDPMDepthPoseInpaintingPipeline,
         DDPM4DVoxelInpaintingPipeline,
         DiffusionPipeline,
         DiTPipeline,
