@@ -14,6 +14,7 @@
 
 
 from typing import List, Optional, Tuple, Union
+from copy import deepcopy
 
 import torch
 
@@ -21,7 +22,7 @@ from ...utils import randn_tensor
 from ..pipeline_utils import DiffusionPipeline, ImagePipelineOutput
 
 
-class DDPMPipeline(DiffusionPipeline):
+class DDPMReconstructionPipeline(DiffusionPipeline):
     r"""
     This model inherits from [`DiffusionPipeline`]. Check the superclass documentation for the generic methods the
     library implements for all the pipelines (such as downloading or saving, running on a particular device, etc.)
@@ -43,6 +44,9 @@ class DDPMPipeline(DiffusionPipeline):
         batch_size: int = 1,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         num_inference_steps: int = 1000,
+        cond_inds: List[int] = [0, 1],
+        recon_scale: float = 1.0,
+        conditioning: torch.Tensor = torch.zeros((1, 64, 64, 2)),
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
     ) -> Union[ImagePipelineOutput, Tuple]:
@@ -77,6 +81,9 @@ class DDPMPipeline(DiffusionPipeline):
         else:
             image_shape = (batch_size, self.unet.config.in_channels, *self.unet.config.sample_size)
 
+        if len(conditioning.shape) == 3:
+            conditioning = torch.stack([conditioning] * batch_size)
+
         if self.device.type == "mps":
             # randn does not work reproducibly on mps
             image = randn_tensor(image_shape, generator=generator)
@@ -86,13 +93,41 @@ class DDPMPipeline(DiffusionPipeline):
 
         # set step values
         self.scheduler.set_timesteps(num_inference_steps)
+        self.scheduler_denoising = deepcopy(self.scheduler)
 
         for t in self.progress_bar(self.scheduler.timesteps):
+
+            image.requires_grad = True
+
+            with torch.enable_grad():
+                # 1. predict noise model_output
+                model_output = self.unet(image, t).sample
+
+                # 2. Take the gradient wrt conditioning channels
+                denoised_image = self.scheduler_denoising.step(model_output, t, image).pred_original_sample
+                mse = torch.nn.functional.mse_loss(denoised_image[:, cond_inds, ...], conditioning, reduction="sum")
+                loss = 0.5 * recon_scale * mse
+                loss.backward()
+
+            # 3. Take a step towards the gradient
+            model_output += image.grad
+
+            # 4. compute previous image: x_t -> x_t-1
+            image = self.scheduler.step(model_output, t, image).prev_sample # , generator=generator).prev_sample
+
+        """
+        # set step values
+        self.scheduler.set_timesteps(num_inference_steps)
+        self.scheduler_noising = deepcopy(self.scheduler)
+
+        for t in self.progress_bar(self.scheduler.timesteps):
+
             # 1. predict noise model_output
             model_output = self.unet(image, t).sample
 
-            # 2. compute previous image: x_t -> x_t-1
-            image = self.scheduler.step(model_output, t, image).prev_sample # , generator=generator).prev_sample
+            # 3. compute previous image: x_t -> x_t-1
+            image = self.scheduler.step(model_output, t, image, conditioning, cond_inds).prev_sample # , generator=generator).prev_sample
+        """
 
         image = (image / 2 + 0.5).clamp(0, 1)
         image = image.cpu().permute(0, 2, 3, 1).numpy()

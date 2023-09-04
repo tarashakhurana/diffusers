@@ -21,7 +21,7 @@ from ...utils import randn_tensor
 from ..pipeline_utils import DiffusionPipeline, ImagePipelineOutput
 
 
-class DDPMPipeline(DiffusionPipeline):
+class DDPMInpaintingPipeline(DiffusionPipeline):
     r"""
     This model inherits from [`DiffusionPipeline`]. Check the superclass documentation for the generic methods the
     library implements for all the pipelines (such as downloading or saving, running on a particular device, etc.)
@@ -40,6 +40,7 @@ class DDPMPipeline(DiffusionPipeline):
     @torch.no_grad()
     def __call__(
         self,
+        inpainting_image: torch.cuda.FloatTensor,
         batch_size: int = 1,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         num_inference_steps: int = 1000,
@@ -50,6 +51,10 @@ class DDPMPipeline(DiffusionPipeline):
         Args:
             batch_size (`int`, *optional*, defaults to 1):
                 The number of images to generate.
+            inpainting_image:
+                The image to use as context for the inpainted output. Currently implemented for depth video forecasting.
+                This image should have the first dimension as the batch dimension. for video forecasting this shape should
+                be B x F x H x W.
             generator (`torch.Generator`, *optional*):
                 One or a list of [torch generator(s)](https://pytorch.org/docs/stable/generated/torch.Generator.html)
                 to make generation deterministic.
@@ -67,15 +72,16 @@ class DDPMPipeline(DiffusionPipeline):
             True, otherwise a `tuple. When returning a tuple, the first element is a list with the generated images.
         """
         # Sample gaussian noise to begin loop
+        # note the change to out channels
         if isinstance(self.unet.config.sample_size, int):
             image_shape = (
                 batch_size,
-                self.unet.config.in_channels,
+                self.unet.config.out_channels,
                 self.unet.config.sample_size,
                 self.unet.config.sample_size,
             )
         else:
-            image_shape = (batch_size, self.unet.config.in_channels, *self.unet.config.sample_size)
+            image_shape = (batch_size, self.unet.config.out_channels, *self.unet.config.sample_size)
 
         if self.device.type == "mps":
             # randn does not work reproducibly on mps
@@ -84,12 +90,22 @@ class DDPMPipeline(DiffusionPipeline):
         else:
             image = randn_tensor(image_shape, generator=generator, device=self.device)
 
+        half_channels = int(self.unet.config.out_channels / 2)
+        assert inpainting_image.shape[1] == half_channels
+        mask = torch.zeros_like(image)
+        mask[:, half_channels:, ...] = torch.ones_like(mask[:, half_channels:, ...])
+        masked_image = torch.zeros_like(image)
+        masked_image[:, :half_channels, ...] = inpainting_image
+
         # set step values
         self.scheduler.set_timesteps(num_inference_steps)
 
         for t in self.progress_bar(self.scheduler.timesteps):
+            # 0. prepare the input to the inpainting model
+            model_inputs = torch.cat([image, masked_image, mask], dim=1)
+
             # 1. predict noise model_output
-            model_output = self.unet(image, t).sample
+            model_output = self.unet(model_inputs, t).sample
 
             # 2. compute previous image: x_t -> x_t-1
             image = self.scheduler.step(model_output, t, image).prev_sample # , generator=generator).prev_sample

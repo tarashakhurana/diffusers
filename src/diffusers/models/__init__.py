@@ -25,6 +25,8 @@ if is_torch_available():
     from .transformer_2d import Transformer2DModel
     from .unet_1d import UNet1DModel
     from .unet_2d import UNet2DModel
+    from .unet_4d_voxel import UNet4DVoxelModel
+    from .unet_static3d_voxel import UNetStatic3DVoxelModel
     from .unet_2d_condition import UNet2DConditionModel
     from .unet_3d_condition import UNet3DConditionModel
     from .vq_model import VQModel

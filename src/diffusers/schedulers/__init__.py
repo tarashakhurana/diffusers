@@ -25,6 +25,7 @@ else:
     from .scheduling_ddim import DDIMScheduler
     from .scheduling_ddim_inverse import DDIMInverseScheduler
     from .scheduling_ddpm import DDPMScheduler
+    from .scheduling_ddpm_conditioning import DDPMConditioningScheduler
     from .scheduling_deis_multistep import DEISMultistepScheduler
     from .scheduling_dpmsolver_multistep import DPMSolverMultistepScheduler
     from .scheduling_dpmsolver_singlestep import DPMSolverSinglestepScheduler

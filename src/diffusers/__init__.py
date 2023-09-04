@@ -44,6 +44,8 @@ else:
         UNet2DConditionModel,
         UNet2DModel,
         UNet3DConditionModel,
+        UNet4DVoxelModel,
+        UNetStatic3DVoxelModel,
         VQModel,
     )
     from .optimization import (
@@ -60,6 +62,9 @@ else:
         DanceDiffusionPipeline,
         DDIMPipeline,
         DDPMPipeline,
+        DDPMReconstructionPipeline,
+        DDPMInpaintingPipeline,
+        DDPM4DVoxelInpaintingPipeline,
         DiffusionPipeline,
         DiTPipeline,
         ImagePipelineOutput,
@@ -74,6 +79,7 @@ else:
         DDIMInverseScheduler,
         DDIMScheduler,
         DDPMScheduler,
+        DDPMConditioningScheduler,
         DEISMultistepScheduler,
         DPMSolverMultistepScheduler,
         DPMSolverSinglestepScheduler,
