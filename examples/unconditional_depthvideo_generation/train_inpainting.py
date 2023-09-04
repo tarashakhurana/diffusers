@@ -351,6 +351,7 @@ class OccfusionDataset(Dataset):
         center_crop=True,
         normalization_factor=20480.0,
         plucker_coords=False,
+        use_harmonic=False,
         visualize=False
     ):
         self.size = size
@@ -360,6 +361,7 @@ class OccfusionDataset(Dataset):
         self.visualize = visualize
         self.normalization_factor = normalization_factor
         self.plucker_coords = plucker_coords
+        self.use_harmonic = use_harmonic
         self.sequence = num_images > 1
 
         self.instance_data_root = Path(instance_data_root)
@@ -405,6 +407,10 @@ class OccfusionDataset(Dataset):
                 if self.plucker_coords:
                     extrinsics = np.load(seq_to_ann[seq])["extrinsics"].astype(np.float32)
                     intrinsics = np.load(seq_to_ann[seq])["intrinsics"].astype(np.float32)
+                    # some intrinsics matrices are invalid
+                    if np.sum(intrinsics[0].astype(int)) == 1: #  or int(intrinsics[0][2][2]) != 1 or int(intrinsics[0][0][0]) == 0 or int(intrinsics[0][1][1]) == 0:
+                        print("#######################################################################################################")
+                        continue
 
                 for idx in range(0, len(frames), self.offset):
                     frame_path = frames[idx]
@@ -474,11 +480,13 @@ class OccfusionDataset(Dataset):
             depth = np.clip(depth, 0, 1)
             depth = depth * 255.0
             depth_preprocessed = self.image_transforms(Image.fromarray(depth.astype("uint8"))).squeeze()
+            assert torch.sum(torch.isinf(depth_preprocessed)) == 0, print(torch.unique(depth_preprocessed))
+            assert torch.sum(torch.isnan(depth_preprocessed)) == 0, print(torch.unique(depth_preprocessed))
             scale = depth_preprocessed.shape[0] / depth.shape[0]
 
             if self.plucker_coords:
-                K = self.intrinsics[ref_index - i]
-
+                K_beforescale = self.intrinsics[ref_index - i]
+                K = K_beforescale.detach().clone()
                 # account for the image resizing operation
                 K[0] *= scale
                 K[1] *= scale
@@ -497,13 +505,26 @@ class OccfusionDataset(Dataset):
                 # cam_coords /= cam_coords[:, :, 2:]
                 # cam_ray_dirs = F.normalize(cam_coords, dim=0)
                 ray_dirs = Rt_inv @ cam_coords_homo
-                ray_dirs = ray_dirs[:3, :]
-                ray_origins = repeat(Rt_inv[:3, 3], 'c -> c n', n=ray_dirs.shape[1])
-                plucker_map = self.encode_plucker(ray_origins.T, ray_dirs.T, use_harmonic=False).reshape(H, W, -1).permute(2, 0, 1)
+                ray_dirs = ray_dirs[:3, :].T / torch.norm(ray_dirs[:3, :].T, dim=-1, keepdim=True)
+                ray_origins = repeat(Rt_inv[:3, 3], 'c -> c n', n=ray_dirs.shape[0]).T
+                assert torch.sum(torch.isnan(ray_origins)) == 0, print(torch.unique(ray_origins))
+                assert torch.sum(torch.isinf(ray_origins)) == 0, print(torch.unique(ray_origins))
+                assert torch.sum(torch.isnan(ray_dirs)) == 0, print(torch.unique(ray_dirs), K_beforescale, K, Rt_inv, torch.unique(cam_coords_homo), torch.sum(K.int()), int(K[0][0]), int(K[1][1]))
+                assert torch.sum(torch.isinf(ray_dirs)) == 0, print(torch.unique(ray_dirs))
+                plucker_rays = self.encode_plucker(ray_origins, ray_dirs, use_harmonic=self.use_harmonic)
+                assert torch.sum(torch.isnan(plucker_rays)) == 0, print(torch.unique(plucker_rays))
+                assert torch.sum(torch.isinf(plucker_rays)) == 0, print(torch.unique(plucker_rays))
+                if False:
+                    plucker_rays = plucker_rays / torch.norm(plucker_rays, dim=-1,keepdim=True)
+                plucker_map = plucker_rays.reshape(H, W, -1).permute(2, 0, 1)
+                assert torch.sum(torch.isnan(plucker_map)) == 0, print("after norm and reshape", torch.unique(plucker_map))
+                assert torch.sum(torch.isinf(plucker_map)) == 0, print("after norm and reshape", torch.unique(plucker_map))
                 plucker_map = transforms.CenterCrop(self.size)(plucker_map)
+                assert torch.sum(torch.isnan(plucker_map)) == 0, print("after transforms", torch.unique(plucker_map))
+                assert torch.sum(torch.isinf(plucker_map)) == 0, print("after transforms", torch.unique(plucker_map))
                 depth_with_plucker_map = torch.cat([depth_preprocessed[None, ...], plucker_map], dim=0)
-                assert torch.sum(torch.isnan(depth_with_plucker_map)) == 0
-                assert torch.sum(torch.isinf(depth_with_plucker_map)) == 0
+                assert torch.sum(torch.isnan(depth_with_plucker_map)) == 0, print(torch.unique(plucker_map), torch.unique(depth_preprocessed))
+                assert torch.sum(torch.isinf(depth_with_plucker_map)) == 0, print(torch.unique(plucker_map), torch.unique(depth_preprocessed))
                 depth_frames.append(depth_with_plucker_map)
 
 
