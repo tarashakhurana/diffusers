@@ -2,22 +2,33 @@ import contextlib
 import gc
 import inspect
 import io
+import json
+import os
 import re
 import tempfile
 import unittest
+import uuid
 from typing import Callable, Union
 
 import numpy as np
+import PIL
 import torch
+from huggingface_hub import delete_repo
+from transformers import CLIPTextConfig, CLIPTextModel, CLIPTokenizer
 
 import diffusers
-from diffusers import DiffusionPipeline
+from diffusers import AutoencoderKL, DDIMScheduler, DiffusionPipeline, StableDiffusionPipeline, UNet2DConditionModel
+from diffusers.image_processor import VaeImageProcessor
+from diffusers.schedulers import KarrasDiffusionSchedulers
 from diffusers.utils import logging
 from diffusers.utils.import_utils import is_accelerate_available, is_accelerate_version, is_xformers_available
-from diffusers.utils.testing_utils import require_torch, torch_device
+from diffusers.utils.testing_utils import (
+    CaptureLogger,
+    require_torch,
+    torch_device,
+)
 
-
-torch.backends.cuda.matmul.allow_tf32 = False
+from ..others.test_utils import TOKEN, USER, is_staging_test
 
 
 def to_np(tensor):
@@ -25,6 +36,180 @@ def to_np(tensor):
         tensor = tensor.detach().cpu().numpy()
 
     return tensor
+
+
+def check_same_shape(tensor_list):
+    shapes = [tensor.shape for tensor in tensor_list]
+    return all(shape == shapes[0] for shape in shapes[1:])
+
+
+class PipelineLatentTesterMixin:
+    """
+    This mixin is designed to be used with PipelineTesterMixin and unittest.TestCase classes.
+    It provides a set of common tests for PyTorch pipeline that has vae, e.g.
+    equivalence of different input and output types, etc.
+    """
+
+    @property
+    def image_params(self) -> frozenset:
+        raise NotImplementedError(
+            "You need to set the attribute `image_params` in the child test class. "
+            "`image_params` are tested for if all accepted input image types (i.e. `pt`,`pil`,`np`) are producing same results"
+        )
+
+    @property
+    def image_latents_params(self) -> frozenset:
+        raise NotImplementedError(
+            "You need to set the attribute `image_latents_params` in the child test class. "
+            "`image_latents_params` are tested for if passing latents directly are producing same results"
+        )
+
+    def get_dummy_inputs_by_type(self, device, seed=0, input_image_type="pt", output_type="np"):
+        inputs = self.get_dummy_inputs(device, seed)
+
+        def convert_to_pt(image):
+            if isinstance(image, torch.Tensor):
+                input_image = image
+            elif isinstance(image, np.ndarray):
+                input_image = VaeImageProcessor.numpy_to_pt(image)
+            elif isinstance(image, PIL.Image.Image):
+                input_image = VaeImageProcessor.pil_to_numpy(image)
+                input_image = VaeImageProcessor.numpy_to_pt(input_image)
+            else:
+                raise ValueError(f"unsupported input_image_type {type(image)}")
+            return input_image
+
+        def convert_pt_to_type(image, input_image_type):
+            if input_image_type == "pt":
+                input_image = image
+            elif input_image_type == "np":
+                input_image = VaeImageProcessor.pt_to_numpy(image)
+            elif input_image_type == "pil":
+                input_image = VaeImageProcessor.pt_to_numpy(image)
+                input_image = VaeImageProcessor.numpy_to_pil(input_image)
+            else:
+                raise ValueError(f"unsupported input_image_type {input_image_type}.")
+            return input_image
+
+        for image_param in self.image_params:
+            if image_param in inputs.keys():
+                inputs[image_param] = convert_pt_to_type(
+                    convert_to_pt(inputs[image_param]).to(device), input_image_type
+                )
+
+        inputs["output_type"] = output_type
+
+        return inputs
+
+    def test_pt_np_pil_outputs_equivalent(self, expected_max_diff=1e-4):
+        self._test_pt_np_pil_outputs_equivalent(expected_max_diff=expected_max_diff)
+
+    def _test_pt_np_pil_outputs_equivalent(self, expected_max_diff=1e-4, input_image_type="pt"):
+        components = self.get_dummy_components()
+        pipe = self.pipeline_class(**components)
+        pipe = pipe.to(torch_device)
+        pipe.set_progress_bar_config(disable=None)
+
+        output_pt = pipe(
+            **self.get_dummy_inputs_by_type(torch_device, input_image_type=input_image_type, output_type="pt")
+        )[0]
+        output_np = pipe(
+            **self.get_dummy_inputs_by_type(torch_device, input_image_type=input_image_type, output_type="np")
+        )[0]
+        output_pil = pipe(
+            **self.get_dummy_inputs_by_type(torch_device, input_image_type=input_image_type, output_type="pil")
+        )[0]
+
+        max_diff = np.abs(output_pt.cpu().numpy().transpose(0, 2, 3, 1) - output_np).max()
+        self.assertLess(
+            max_diff, expected_max_diff, "`output_type=='pt'` generate different results from `output_type=='np'`"
+        )
+
+        max_diff = np.abs(np.array(output_pil[0]) - (output_np * 255).round()).max()
+        self.assertLess(max_diff, 2.0, "`output_type=='pil'` generate different results from `output_type=='np'`")
+
+    def test_pt_np_pil_inputs_equivalent(self):
+        if len(self.image_params) == 0:
+            return
+
+        components = self.get_dummy_components()
+        pipe = self.pipeline_class(**components)
+        pipe = pipe.to(torch_device)
+        pipe.set_progress_bar_config(disable=None)
+
+        out_input_pt = pipe(**self.get_dummy_inputs_by_type(torch_device, input_image_type="pt"))[0]
+        out_input_np = pipe(**self.get_dummy_inputs_by_type(torch_device, input_image_type="np"))[0]
+        out_input_pil = pipe(**self.get_dummy_inputs_by_type(torch_device, input_image_type="pil"))[0]
+
+        max_diff = np.abs(out_input_pt - out_input_np).max()
+        self.assertLess(max_diff, 1e-4, "`input_type=='pt'` generate different result from `input_type=='np'`")
+        max_diff = np.abs(out_input_pil - out_input_np).max()
+        self.assertLess(max_diff, 1e-2, "`input_type=='pt'` generate different result from `input_type=='np'`")
+
+    def test_latents_input(self):
+        if len(self.image_latents_params) == 0:
+            return
+
+        components = self.get_dummy_components()
+        pipe = self.pipeline_class(**components)
+        pipe.image_processor = VaeImageProcessor(do_resize=False, do_normalize=False)
+        pipe = pipe.to(torch_device)
+        pipe.set_progress_bar_config(disable=None)
+
+        out = pipe(**self.get_dummy_inputs_by_type(torch_device, input_image_type="pt"))[0]
+
+        vae = components["vae"]
+        inputs = self.get_dummy_inputs_by_type(torch_device, input_image_type="pt")
+        generator = inputs["generator"]
+        for image_param in self.image_latents_params:
+            if image_param in inputs.keys():
+                inputs[image_param] = (
+                    vae.encode(inputs[image_param]).latent_dist.sample(generator) * vae.config.scaling_factor
+                )
+        out_latents_inputs = pipe(**inputs)[0]
+
+        max_diff = np.abs(out - out_latents_inputs).max()
+        self.assertLess(max_diff, 1e-4, "passing latents as image input generate different result from passing image")
+
+
+@require_torch
+class PipelineKarrasSchedulerTesterMixin:
+    """
+    This mixin is designed to be used with unittest.TestCase classes.
+    It provides a set of common tests for each PyTorch pipeline that makes use of KarrasDiffusionSchedulers
+    equivalence of dict and tuple outputs, etc.
+    """
+
+    def test_karras_schedulers_shape(self):
+        components = self.get_dummy_components()
+        pipe = self.pipeline_class(**components)
+
+        # make sure that PNDM does not need warm-up
+        pipe.scheduler.register_to_config(skip_prk_steps=True)
+
+        pipe.to(torch_device)
+        pipe.set_progress_bar_config(disable=None)
+        inputs = self.get_dummy_inputs(torch_device)
+        inputs["num_inference_steps"] = 2
+
+        if "strength" in inputs:
+            inputs["num_inference_steps"] = 4
+            inputs["strength"] = 0.5
+
+        outputs = []
+        for scheduler_enum in KarrasDiffusionSchedulers:
+            if "KDPM2" in scheduler_enum.name:
+                inputs["num_inference_steps"] = 5
+
+            scheduler_cls = getattr(diffusers, scheduler_enum.name)
+            pipe.scheduler = scheduler_cls.from_config(pipe.scheduler.config)
+            output = pipe(**inputs)[0]
+            outputs.append(output)
+
+            if "KDPM2" in scheduler_enum.name:
+                inputs["num_inference_steps"] = 2
+
+        assert check_same_shape(outputs)
 
 
 @require_torch
@@ -53,7 +238,7 @@ class PipelineTesterMixin:
 
     # set these parameters to False in the child class if the pipeline does not support the corresponding functionality
     test_attention_slicing = True
-    test_cpu_offload = True
+
     test_xformers_attention = True
 
     def get_generator(self, seed):
@@ -115,18 +300,32 @@ class PipelineTesterMixin:
         gc.collect()
         torch.cuda.empty_cache()
 
-    def test_save_load_local(self):
+    def test_save_load_local(self, expected_max_difference=5e-4):
         components = self.get_dummy_components()
         pipe = self.pipeline_class(**components)
+        for component in pipe.components.values():
+            if hasattr(component, "set_default_attn_processor"):
+                component.set_default_attn_processor()
+
         pipe.to(torch_device)
         pipe.set_progress_bar_config(disable=None)
 
         inputs = self.get_dummy_inputs(torch_device)
         output = pipe(**inputs)[0]
 
+        logger = logging.get_logger("diffusers.pipelines.pipeline_utils")
+        logger.setLevel(diffusers.logging.INFO)
+
         with tempfile.TemporaryDirectory() as tmpdir:
-            pipe.save_pretrained(tmpdir)
-            pipe_loaded = self.pipeline_class.from_pretrained(tmpdir)
+            pipe.save_pretrained(tmpdir, safe_serialization=False)
+
+            with CaptureLogger(logger) as cap_logger:
+                pipe_loaded = self.pipeline_class.from_pretrained(tmpdir)
+
+            for name in pipe_loaded.components.keys():
+                if name not in pipe_loaded._optional_components:
+                    assert name in str(cap_logger)
+
             pipe_loaded.to(torch_device)
             pipe_loaded.set_progress_bar_config(disable=None)
 
@@ -134,7 +333,7 @@ class PipelineTesterMixin:
         output_loaded = pipe_loaded(**inputs)[0]
 
         max_diff = np.abs(to_np(output) - to_np(output_loaded)).max()
-        self.assertLess(max_diff, 1e-4)
+        self.assertLess(max_diff, expected_max_difference)
 
     def test_pipeline_call_signature(self):
         self.assertTrue(
@@ -203,7 +402,7 @@ class PipelineTesterMixin:
                         batched_inputs[name] = [value[: len_prompt // i] for i in range(1, batch_size + 1)]
 
                         # make last batch super long
-                        batched_inputs[name][-1] = 2000 * "very long"
+                        batched_inputs[name][-1] = 100 * "very long"
                     # or else we have images
                     else:
                         batched_inputs[name] = batch_size * [value]
@@ -215,7 +414,7 @@ class PipelineTesterMixin:
             for arg in additional_params_copy_to_batched_inputs:
                 batched_inputs[arg] = inputs[arg]
 
-            batched_inputs["output_type"] = None
+            batched_inputs["output_type"] = "np"
 
             if self.pipeline_class.__name__ == "DanceDiffusionPipeline":
                 batched_inputs.pop("output_type")
@@ -235,8 +434,8 @@ class PipelineTesterMixin:
 
         logger.setLevel(level=diffusers.logging.WARNING)
 
-    def test_inference_batch_single_identical(self, batch_size=3):
-        self._test_inference_batch_single_identical(batch_size=batch_size)
+    def test_inference_batch_single_identical(self, batch_size=3, expected_max_diff=1e-4):
+        self._test_inference_batch_single_identical(batch_size=batch_size, expected_max_diff=expected_max_diff)
 
     def _test_inference_batch_single_identical(
         self,
@@ -278,7 +477,7 @@ class PipelineTesterMixin:
                     batched_inputs[name] = [value[: len_prompt // i] for i in range(1, batch_size + 1)]
 
                     # make last batch super long
-                    batched_inputs[name][-1] = 2000 * "very long"
+                    batched_inputs[name][-1] = 100 * "very long"
                 # or else we have images
                 else:
                     batched_inputs[name] = batch_size * [value]
@@ -318,9 +517,13 @@ class PipelineTesterMixin:
         if test_mean_pixel_difference:
             assert_mean_pixel_difference(output_batch[0][0], output[0][0])
 
-    def test_dict_tuple_outputs_equivalent(self):
+    def test_dict_tuple_outputs_equivalent(self, expected_max_difference=1e-4):
         components = self.get_dummy_components()
         pipe = self.pipeline_class(**components)
+        for component in pipe.components.values():
+            if hasattr(component, "set_default_attn_processor"):
+                component.set_default_attn_processor()
+
         pipe.to(torch_device)
         pipe.set_progress_bar_config(disable=None)
 
@@ -328,7 +531,7 @@ class PipelineTesterMixin:
         output_tuple = pipe(**self.get_dummy_inputs(torch_device), return_dict=False)[0]
 
         max_diff = np.abs(to_np(output) - to_np(output_tuple)).max()
-        self.assertLess(max_diff, 1e-4)
+        self.assertLess(max_diff, expected_max_difference)
 
     def test_components_function(self):
         init_components = self.get_dummy_components()
@@ -338,13 +541,22 @@ class PipelineTesterMixin:
         self.assertTrue(set(pipe.components.keys()) == set(init_components.keys()))
 
     @unittest.skipIf(torch_device != "cuda", reason="float16 requires CUDA")
-    def test_float16_inference(self):
+    def test_float16_inference(self, expected_max_diff=1e-2):
         components = self.get_dummy_components()
         pipe = self.pipeline_class(**components)
+        for component in pipe.components.values():
+            if hasattr(component, "set_default_attn_processor"):
+                component.set_default_attn_processor()
+
         pipe.to(torch_device)
         pipe.set_progress_bar_config(disable=None)
 
+        components = self.get_dummy_components()
         pipe_fp16 = self.pipeline_class(**components)
+        for component in pipe_fp16.components.values():
+            if hasattr(component, "set_default_attn_processor"):
+                component.set_default_attn_processor()
+
         pipe_fp16.to(torch_device, torch.float16)
         pipe_fp16.set_progress_bar_config(disable=None)
 
@@ -352,15 +564,19 @@ class PipelineTesterMixin:
         output_fp16 = pipe_fp16(**self.get_dummy_inputs(torch_device))[0]
 
         max_diff = np.abs(to_np(output) - to_np(output_fp16)).max()
-        self.assertLess(max_diff, 1e-2, "The outputs of the fp16 and fp32 pipelines are too different.")
+        self.assertLess(max_diff, expected_max_diff, "The outputs of the fp16 and fp32 pipelines are too different.")
 
     @unittest.skipIf(torch_device != "cuda", reason="float16 requires CUDA")
-    def test_save_load_float16(self):
+    def test_save_load_float16(self, expected_max_diff=1e-2):
         components = self.get_dummy_components()
         for name, module in components.items():
             if hasattr(module, "half"):
                 components[name] = module.to(torch_device).half()
+
         pipe = self.pipeline_class(**components)
+        for component in pipe.components.values():
+            if hasattr(component, "set_default_attn_processor"):
+                component.set_default_attn_processor()
         pipe.to(torch_device)
         pipe.set_progress_bar_config(disable=None)
 
@@ -370,6 +586,9 @@ class PipelineTesterMixin:
         with tempfile.TemporaryDirectory() as tmpdir:
             pipe.save_pretrained(tmpdir)
             pipe_loaded = self.pipeline_class.from_pretrained(tmpdir, torch_dtype=torch.float16)
+            for component in pipe_loaded.components.values():
+                if hasattr(component, "set_default_attn_processor"):
+                    component.set_default_attn_processor()
             pipe_loaded.to(torch_device)
             pipe_loaded.set_progress_bar_config(disable=None)
 
@@ -382,16 +601,20 @@ class PipelineTesterMixin:
 
         inputs = self.get_dummy_inputs(torch_device)
         output_loaded = pipe_loaded(**inputs)[0]
-
         max_diff = np.abs(to_np(output) - to_np(output_loaded)).max()
-        self.assertLess(max_diff, 1e-2, "The output of the fp16 pipeline changed after saving and loading.")
+        self.assertLess(
+            max_diff, expected_max_diff, "The output of the fp16 pipeline changed after saving and loading."
+        )
 
-    def test_save_load_optional_components(self):
+    def test_save_load_optional_components(self, expected_max_difference=1e-4):
         if not hasattr(self.pipeline_class, "_optional_components"):
             return
 
         components = self.get_dummy_components()
         pipe = self.pipeline_class(**components)
+        for component in pipe.components.values():
+            if hasattr(component, "set_default_attn_processor"):
+                component.set_default_attn_processor()
         pipe.to(torch_device)
         pipe.set_progress_bar_config(disable=None)
 
@@ -403,8 +626,11 @@ class PipelineTesterMixin:
         output = pipe(**inputs)[0]
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            pipe.save_pretrained(tmpdir)
+            pipe.save_pretrained(tmpdir, safe_serialization=False)
             pipe_loaded = self.pipeline_class.from_pretrained(tmpdir)
+            for component in pipe_loaded.components.values():
+                if hasattr(component, "set_default_attn_processor"):
+                    component.set_default_attn_processor()
             pipe_loaded.to(torch_device)
             pipe_loaded.set_progress_bar_config(disable=None)
 
@@ -418,7 +644,7 @@ class PipelineTesterMixin:
         output_loaded = pipe_loaded(**inputs)[0]
 
         max_diff = np.abs(to_np(output) - to_np(output_loaded)).max()
-        self.assertLess(max_diff, 1e-4)
+        self.assertLess(max_diff, expected_max_difference)
 
     @unittest.skipIf(torch_device != "cuda", reason="CUDA and CPU are required to switch devices")
     def test_to_device(self):
@@ -452,8 +678,8 @@ class PipelineTesterMixin:
         model_dtypes = [component.dtype for component in components.values() if hasattr(component, "dtype")]
         self.assertTrue(all(dtype == torch.float16 for dtype in model_dtypes))
 
-    def test_attention_slicing_forward_pass(self):
-        self._test_attention_slicing_forward_pass()
+    def test_attention_slicing_forward_pass(self, expected_max_diff=1e-3):
+        self._test_attention_slicing_forward_pass(expected_max_diff=expected_max_diff)
 
     def _test_attention_slicing_forward_pass(
         self, test_max_difference=True, test_mean_pixel_difference=True, expected_max_diff=1e-3
@@ -463,6 +689,9 @@ class PipelineTesterMixin:
 
         components = self.get_dummy_components()
         pipe = self.pipeline_class(**components)
+        for component in pipe.components.values():
+            if hasattr(component, "set_default_attn_processor"):
+                component.set_default_attn_processor()
         pipe.to(torch_device)
         pipe.set_progress_bar_config(disable=None)
 
@@ -484,12 +713,12 @@ class PipelineTesterMixin:
         torch_device != "cuda" or not is_accelerate_available() or is_accelerate_version("<", "0.14.0"),
         reason="CPU offload is only available with CUDA and `accelerate v0.14.0` or higher",
     )
-    def test_cpu_offload_forward_pass(self):
-        if not self.test_cpu_offload:
-            return
-
+    def test_cpu_offload_forward_pass(self, expected_max_diff=1e-4):
         components = self.get_dummy_components()
         pipe = self.pipeline_class(**components)
+        for component in pipe.components.values():
+            if hasattr(component, "set_default_attn_processor"):
+                component.set_default_attn_processor()
         pipe.to(torch_device)
         pipe.set_progress_bar_config(disable=None)
 
@@ -501,7 +730,7 @@ class PipelineTesterMixin:
         output_with_offload = pipe(**inputs)[0]
 
         max_diff = np.abs(to_np(output_with_offload) - to_np(output_without_offload)).max()
-        self.assertLess(max_diff, 1e-4, "CPU offloading should not affect the inference results")
+        self.assertLess(max_diff, expected_max_diff, "CPU offloading should not affect the inference results")
 
     @unittest.skipIf(
         torch_device != "cuda" or not is_xformers_available(),
@@ -510,27 +739,39 @@ class PipelineTesterMixin:
     def test_xformers_attention_forwardGenerator_pass(self):
         self._test_xformers_attention_forwardGenerator_pass()
 
-    def _test_xformers_attention_forwardGenerator_pass(self, test_max_difference=True, expected_max_diff=1e-4):
+    def _test_xformers_attention_forwardGenerator_pass(
+        self, test_max_difference=True, test_mean_pixel_difference=True, expected_max_diff=1e-4
+    ):
         if not self.test_xformers_attention:
             return
 
         components = self.get_dummy_components()
         pipe = self.pipeline_class(**components)
+        for component in pipe.components.values():
+            if hasattr(component, "set_default_attn_processor"):
+                component.set_default_attn_processor()
         pipe.to(torch_device)
         pipe.set_progress_bar_config(disable=None)
 
         inputs = self.get_dummy_inputs(torch_device)
         output_without_offload = pipe(**inputs)[0]
+        output_without_offload = (
+            output_without_offload.cpu() if torch.is_tensor(output_without_offload) else output_without_offload
+        )
 
         pipe.enable_xformers_memory_efficient_attention()
         inputs = self.get_dummy_inputs(torch_device)
         output_with_offload = pipe(**inputs)[0]
+        output_with_offload = (
+            output_with_offload.cpu() if torch.is_tensor(output_with_offload) else output_without_offload
+        )
 
         if test_max_difference:
-            max_diff = np.abs(output_with_offload - output_without_offload).max()
+            max_diff = np.abs(to_np(output_with_offload) - to_np(output_without_offload)).max()
             self.assertLess(max_diff, expected_max_diff, "XFormers attention should not affect the inference results")
 
-        assert_mean_pixel_difference(output_with_offload[0], output_without_offload[0])
+        if test_mean_pixel_difference:
+            assert_mean_pixel_difference(output_with_offload[0], output_without_offload[0])
 
     def test_progress_bar(self):
         components = self.get_dummy_components()
@@ -576,16 +817,157 @@ class PipelineTesterMixin:
                     if key in self.batch_params:
                         inputs[key] = batch_size * [inputs[key]]
 
-                images = pipe(**inputs, num_images_per_prompt=num_images_per_prompt).images
+                images = pipe(**inputs, num_images_per_prompt=num_images_per_prompt)[0]
 
                 assert images.shape[0] == batch_size * num_images_per_prompt
+
+    def test_cfg(self):
+        sig = inspect.signature(self.pipeline_class.__call__)
+
+        if "guidance_scale" not in sig.parameters:
+            return
+
+        components = self.get_dummy_components()
+        pipe = self.pipeline_class(**components)
+        pipe = pipe.to(torch_device)
+        pipe.set_progress_bar_config(disable=None)
+
+        inputs = self.get_dummy_inputs(torch_device)
+
+        inputs["guidance_scale"] = 1.0
+        out_no_cfg = pipe(**inputs)[0]
+
+        inputs["guidance_scale"] = 7.5
+        out_cfg = pipe(**inputs)[0]
+
+        assert out_cfg.shape == out_no_cfg.shape
+
+
+@is_staging_test
+class PipelinePushToHubTester(unittest.TestCase):
+    identifier = uuid.uuid4()
+    repo_id = f"test-pipeline-{identifier}"
+    org_repo_id = f"valid_org/{repo_id}-org"
+
+    def get_pipeline_components(self):
+        unet = UNet2DConditionModel(
+            block_out_channels=(32, 64),
+            layers_per_block=2,
+            sample_size=32,
+            in_channels=4,
+            out_channels=4,
+            down_block_types=("DownBlock2D", "CrossAttnDownBlock2D"),
+            up_block_types=("CrossAttnUpBlock2D", "UpBlock2D"),
+            cross_attention_dim=32,
+        )
+
+        scheduler = DDIMScheduler(
+            beta_start=0.00085,
+            beta_end=0.012,
+            beta_schedule="scaled_linear",
+            clip_sample=False,
+            set_alpha_to_one=False,
+        )
+
+        vae = AutoencoderKL(
+            block_out_channels=[32, 64],
+            in_channels=3,
+            out_channels=3,
+            down_block_types=["DownEncoderBlock2D", "DownEncoderBlock2D"],
+            up_block_types=["UpDecoderBlock2D", "UpDecoderBlock2D"],
+            latent_channels=4,
+        )
+
+        text_encoder_config = CLIPTextConfig(
+            bos_token_id=0,
+            eos_token_id=2,
+            hidden_size=32,
+            intermediate_size=37,
+            layer_norm_eps=1e-05,
+            num_attention_heads=4,
+            num_hidden_layers=5,
+            pad_token_id=1,
+            vocab_size=1000,
+        )
+        text_encoder = CLIPTextModel(text_encoder_config)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dummy_vocab = {"<|startoftext|>": 0, "<|endoftext|>": 1, "!": 2}
+            vocab_path = os.path.join(tmpdir, "vocab.json")
+            with open(vocab_path, "w") as f:
+                json.dump(dummy_vocab, f)
+
+            merges = "Ġ t\nĠt h"
+            merges_path = os.path.join(tmpdir, "merges.txt")
+            with open(merges_path, "w") as f:
+                f.writelines(merges)
+            tokenizer = CLIPTokenizer(vocab_file=vocab_path, merges_file=merges_path)
+
+        components = {
+            "unet": unet,
+            "scheduler": scheduler,
+            "vae": vae,
+            "text_encoder": text_encoder,
+            "tokenizer": tokenizer,
+            "safety_checker": None,
+            "feature_extractor": None,
+        }
+        return components
+
+    def test_push_to_hub(self):
+        components = self.get_pipeline_components()
+        pipeline = StableDiffusionPipeline(**components)
+        pipeline.push_to_hub(self.repo_id, token=TOKEN)
+
+        new_model = UNet2DConditionModel.from_pretrained(f"{USER}/{self.repo_id}", subfolder="unet")
+        unet = components["unet"]
+        for p1, p2 in zip(unet.parameters(), new_model.parameters()):
+            self.assertTrue(torch.equal(p1, p2))
+
+        # Reset repo
+        delete_repo(token=TOKEN, repo_id=self.repo_id)
+
+        # Push to hub via save_pretrained
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pipeline.save_pretrained(tmp_dir, repo_id=self.repo_id, push_to_hub=True, token=TOKEN)
+
+        new_model = UNet2DConditionModel.from_pretrained(f"{USER}/{self.repo_id}", subfolder="unet")
+        for p1, p2 in zip(unet.parameters(), new_model.parameters()):
+            self.assertTrue(torch.equal(p1, p2))
+
+        # Reset repo
+        delete_repo(self.repo_id, token=TOKEN)
+
+    def test_push_to_hub_in_organization(self):
+        components = self.get_pipeline_components()
+        pipeline = StableDiffusionPipeline(**components)
+        pipeline.push_to_hub(self.org_repo_id, token=TOKEN)
+
+        new_model = UNet2DConditionModel.from_pretrained(self.org_repo_id, subfolder="unet")
+        unet = components["unet"]
+        for p1, p2 in zip(unet.parameters(), new_model.parameters()):
+            self.assertTrue(torch.equal(p1, p2))
+
+        # Reset repo
+        delete_repo(token=TOKEN, repo_id=self.org_repo_id)
+
+        # Push to hub via save_pretrained
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pipeline.save_pretrained(tmp_dir, push_to_hub=True, token=TOKEN, repo_id=self.org_repo_id)
+
+        new_model = UNet2DConditionModel.from_pretrained(self.org_repo_id, subfolder="unet")
+        for p1, p2 in zip(unet.parameters(), new_model.parameters()):
+            self.assertTrue(torch.equal(p1, p2))
+
+        # Reset repo
+        delete_repo(self.org_repo_id, token=TOKEN)
 
 
 # Some models (e.g. unCLIP) are extremely likely to significantly deviate depending on which hardware is used.
 # This helper function is used to check that the image doesn't deviate on average more than 10 pixels from a
 # reference image.
-def assert_mean_pixel_difference(image, expected_image):
+def assert_mean_pixel_difference(image, expected_image, expected_max_diff=10):
     image = np.asarray(DiffusionPipeline.numpy_to_pil(image)[0], dtype=np.float32)
     expected_image = np.asarray(DiffusionPipeline.numpy_to_pil(expected_image)[0], dtype=np.float32)
     avg_diff = np.abs(image - expected_image).mean()
-    assert avg_diff < 10, f"Error image deviates {avg_diff} pixels on average"
+    assert avg_diff < expected_max_diff, f"Error image deviates {avg_diff} pixels on average"

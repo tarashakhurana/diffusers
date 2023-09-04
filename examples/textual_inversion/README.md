@@ -36,7 +36,6 @@ And initialize an [🤗Accelerate](https://github.com/huggingface/accelerate/) e
 accelerate config
 ```
 
-
 ### Cat toy example
 
 First, let's login so that we can upload the checkpoint to the Hub during training:
@@ -83,12 +82,25 @@ accelerate launch textual_inversion.py \
 
 A full training run takes ~1 hour on one V100 GPU.
 
+**Note**: As described in [the official paper](https://arxiv.org/abs/2208.01618) 
+only one embedding vector is used for the placeholder token, *e.g.* `"<cat-toy>"`.
+However, one can also add multiple embedding vectors for the placeholder token 
+to inclease the number of fine-tuneable parameters. This can help the model to learn 
+more complex details. To use multiple embedding vectors, you can should define `--num_vectors` 
+to a number larger than one, *e.g.*:
+```
+--num_vectors 5
+```
+
+The saved textual inversion vectors will then be larger in size compared to the default case.
+
 ### Inference
 
 Once you have trained a model using above command, the inference can be done simply using the `StableDiffusionPipeline`. Make sure to include the `placeholder_token` in your prompt.
 
 ```python
 from diffusers import StableDiffusionPipeline
+import torch
 
 model_id = "path-to-your-trained-model"
 pipe = StableDiffusionPipeline.from_pretrained(model_id,torch_dtype=torch.float16).to("cuda")

@@ -1,10 +1,11 @@
-__version__ = "0.16.0.dev0"
+__version__ = "0.21.0.dev0"
 
 from .configuration_utils import ConfigMixin
 from .utils import (
     OptionalDependencyNotAvailable,
     is_flax_available,
     is_inflect_available,
+    is_invisible_watermark_available,
     is_k_diffusion_available,
     is_k_diffusion_version,
     is_librosa_available,
@@ -12,6 +13,7 @@ from .utils import (
     is_onnx_available,
     is_scipy_available,
     is_torch_available,
+    is_torchsde_available,
     is_transformers_available,
     is_transformers_version,
     is_unidecode_available,
@@ -34,10 +36,14 @@ except OptionalDependencyNotAvailable:
     from .utils.dummy_pt_objects import *  # noqa F403
 else:
     from .models import (
+        AsymmetricAutoencoderKL,
         AutoencoderKL,
+        AutoencoderTiny,
         ControlNetModel,
         ModelMixin,
+        MultiAdapter,
         PriorTransformer,
+        T2IAdapter,
         T5FilmDecoder,
         Transformer2DModel,
         UNet1DModel,
@@ -59,6 +65,11 @@ else:
     )
     from .pipelines import (
         AudioPipelineOutput,
+        AutoPipelineForImage2Image,
+        AutoPipelineForInpainting,
+        AutoPipelineForText2Image,
+        CLIPImageProjection,
+        ConsistencyModelPipeline,
         DanceDiffusionPipeline,
         DDIMPipeline,
         DDPMPipeline,
@@ -76,11 +87,15 @@ else:
         ScoreSdeVePipeline,
     )
     from .schedulers import (
+        CMStochasticIterativeScheduler,
         DDIMInverseScheduler,
+        DDIMParallelScheduler,
         DDIMScheduler,
+        DDPMParallelScheduler,
         DDPMScheduler,
         DDPMConditioningScheduler,
         DEISMultistepScheduler,
+        DPMSolverMultistepInverseScheduler,
         DPMSolverMultistepScheduler,
         DPMSolverSinglestepScheduler,
         EulerAncestralDiscreteScheduler,
@@ -108,6 +123,13 @@ except OptionalDependencyNotAvailable:
 else:
     from .schedulers import LMSDiscreteScheduler
 
+try:
+    if not (is_torch_available() and is_torchsde_available()):
+        raise OptionalDependencyNotAvailable()
+except OptionalDependencyNotAvailable:
+    from .utils.dummy_torch_and_torchsde_objects import *  # noqa F403
+else:
+    from .schedulers import DPMSolverSDEScheduler
 
 try:
     if not (is_torch_available() and is_transformers_available()):
@@ -118,37 +140,87 @@ else:
     from .pipelines import (
         AltDiffusionImg2ImgPipeline,
         AltDiffusionPipeline,
+        AudioLDM2Pipeline,
+        AudioLDM2ProjectionModel,
+        AudioLDM2UNet2DConditionModel,
         AudioLDMPipeline,
         CycleDiffusionPipeline,
+        IFImg2ImgPipeline,
+        IFImg2ImgSuperResolutionPipeline,
+        IFInpaintingPipeline,
+        IFInpaintingSuperResolutionPipeline,
+        IFPipeline,
+        IFSuperResolutionPipeline,
+        ImageTextPipelineOutput,
+        KandinskyCombinedPipeline,
+        KandinskyImg2ImgCombinedPipeline,
+        KandinskyImg2ImgPipeline,
+        KandinskyInpaintCombinedPipeline,
+        KandinskyInpaintPipeline,
+        KandinskyPipeline,
+        KandinskyPriorPipeline,
+        KandinskyV22CombinedPipeline,
+        KandinskyV22ControlnetImg2ImgPipeline,
+        KandinskyV22ControlnetPipeline,
+        KandinskyV22Img2ImgCombinedPipeline,
+        KandinskyV22Img2ImgPipeline,
+        KandinskyV22InpaintCombinedPipeline,
+        KandinskyV22InpaintPipeline,
+        KandinskyV22Pipeline,
+        KandinskyV22PriorEmb2EmbPipeline,
+        KandinskyV22PriorPipeline,
         LDMTextToImagePipeline,
+        MusicLDMPipeline,
         PaintByExamplePipeline,
         SemanticStableDiffusionPipeline,
+        ShapEImg2ImgPipeline,
+        ShapEPipeline,
+        StableDiffusionAdapterPipeline,
         StableDiffusionAttendAndExcitePipeline,
+        StableDiffusionControlNetImg2ImgPipeline,
+        StableDiffusionControlNetInpaintPipeline,
         StableDiffusionControlNetPipeline,
         StableDiffusionDepth2ImgPipeline,
+        StableDiffusionDiffEditPipeline,
+        StableDiffusionGLIGENPipeline,
+        StableDiffusionGLIGENTextImagePipeline,
         StableDiffusionImageVariationPipeline,
         StableDiffusionImg2ImgPipeline,
         StableDiffusionInpaintPipeline,
         StableDiffusionInpaintPipelineLegacy,
         StableDiffusionInstructPix2PixPipeline,
         StableDiffusionLatentUpscalePipeline,
+        StableDiffusionLDM3DPipeline,
         StableDiffusionModelEditingPipeline,
         StableDiffusionPanoramaPipeline,
+        StableDiffusionParadigmsPipeline,
         StableDiffusionPipeline,
         StableDiffusionPipelineSafe,
         StableDiffusionPix2PixZeroPipeline,
         StableDiffusionSAGPipeline,
         StableDiffusionUpscalePipeline,
+        StableDiffusionXLAdapterPipeline,
+        StableDiffusionXLControlNetImg2ImgPipeline,
+        StableDiffusionXLControlNetInpaintPipeline,
+        StableDiffusionXLControlNetPipeline,
+        StableDiffusionXLImg2ImgPipeline,
+        StableDiffusionXLInpaintPipeline,
+        StableDiffusionXLInstructPix2PixPipeline,
+        StableDiffusionXLPipeline,
         StableUnCLIPImg2ImgPipeline,
         StableUnCLIPPipeline,
         TextToVideoSDPipeline,
         TextToVideoZeroPipeline,
         UnCLIPImageVariationPipeline,
         UnCLIPPipeline,
+        UniDiffuserModel,
+        UniDiffuserPipeline,
+        UniDiffuserTextDecoder,
         VersatileDiffusionDualGuidedPipeline,
         VersatileDiffusionImageVariationPipeline,
         VersatileDiffusionPipeline,
         VersatileDiffusionTextToImagePipeline,
+        VideoToVideoSDPipeline,
         VQDiffusionPipeline,
     )
 
