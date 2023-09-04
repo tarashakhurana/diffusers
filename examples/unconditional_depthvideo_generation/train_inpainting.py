@@ -416,7 +416,7 @@ class OccfusionDataset(Dataset):
 
                         extrinsic = R2 @ extrinsics[idx] @ R1
                         self.extrinsics.append(torch.from_numpy(extrinsic.astype(np.float32)))
-                        self.intrinsics.append(torch.from_numpy(intrinsics[idx]))
+                        self.intrinsics.append(torch.from_numpy(intrinsics[0]))
 
                 #
                 end_index = len(self.filenames)
@@ -502,6 +502,8 @@ class OccfusionDataset(Dataset):
                 plucker_map = self.encode_plucker(ray_origins.T, ray_dirs.T, use_harmonic=False).reshape(H, W, -1).permute(2, 0, 1)
                 plucker_map = transforms.CenterCrop(self.size)(plucker_map)
                 depth_with_plucker_map = torch.cat([depth_preprocessed[None, ...], plucker_map], dim=0)
+                assert torch.sum(torch.isnan(depth_with_plucker_map)) == 0
+                assert torch.sum(torch.isinf(depth_with_plucker_map)) == 0
                 depth_frames.append(depth_with_plucker_map)
 
 

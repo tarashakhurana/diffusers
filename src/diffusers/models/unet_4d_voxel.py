@@ -26,7 +26,7 @@ from .unet_2d_blocks import UNetMidBlock2D, get_down_block, get_up_block
 from .unet_2d import UNet2DModel
 from torch.utils.cpp_extension import load
 
-dvr = load("dvr", sources=["lib/dvr/dvr.cpp", "lib/dvr/dvr.cu"], verbose=True, extra_cuda_cflags=['-allow-unsupported-compiler'])
+dvr = load("dvr", sources=["/home/tkhurana/freespaceForecasting/ff3d-private/lib/dvr/dvr.cpp", "/home/tkhurana/freespaceForecasting/ff3d-private/lib/dvr/dvr.cu"], verbose=True, extra_cuda_cflags=['-allow-unsupported-compiler'])
 
 
 @dataclass
