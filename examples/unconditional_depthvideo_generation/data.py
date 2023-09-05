@@ -483,6 +483,7 @@ class OccfusionDataset(Dataset):
         depth_frames = []
         all_ray_origin = []
         all_ray_dirs_unnormalized = []
+        all_cam_coords = []
 
         if self.visualize:
             all_points = []
@@ -552,6 +553,7 @@ class OccfusionDataset(Dataset):
                 depth_frames.append(depth_with_plucker_map)
                 all_ray_origin.append(ray_origins[0][None, :])
                 all_ray_dirs_unnormalized.append(ray_dirs_unnormalized[:3, :].T)
+                all_cam_coords.append(cam_coords.T)
 
                 if self.visualize:
 
@@ -576,6 +578,7 @@ class OccfusionDataset(Dataset):
         depth_video = torch.stack(depth_frames, axis=0)
         all_ray_origin = torch.stack(all_ray_origin, axis=0)
         all_ray_dirs_unnormalized = torch.stack(all_ray_dirs_unnormalized, axis=0)
+        all_cam_coords = torch.stack(all_cam_coords, axis=0)
 
         if self.visualize:
             all_points = np.concatenate(all_points, axis=0)
@@ -586,5 +589,6 @@ class OccfusionDataset(Dataset):
         example["input"] = depth_video  # video is of shape T x H x W or T x C x H x W
         example["ray_origin"] = all_ray_origin
         example["ray_direction"] = all_ray_dirs_unnormalized
+        example["cam_coords"] = all_cam_coords
         return example
 

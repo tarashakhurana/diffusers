@@ -41,10 +41,14 @@ def collate_fn(examples):
     ray_direction = torch.stack([example["ray_direction"] for example in examples])
     ray_direction = ray_direction.to(memory_format=torch.contiguous_format).float()
 
+    cam_coords = torch.stack([example["cam_coords"] for example in examples])
+    cam_coords = cam_coords.to(memory_format=torch.contiguous_format).float()
+
     return {
         "input": inputs,
         "ray_origin": ray_origin,
-        "ray_direction": ray_direction
+        "ray_direction": ray_direction,
+        "cam_coords": cam_coords
     }
 
 
@@ -132,6 +136,14 @@ def parse_args():
         default=20400.0,
         help=(
             "Factor to divide the input depth images by"
+        ),
+    )
+    parser.add_argument(
+        "--scale_factor",
+        type=float,
+        default=80.0,
+        help=(
+            "Factor to multiply the output by in order to get the predictions in a metric space"
         ),
     )
     parser.add_argument(
@@ -277,6 +289,7 @@ def main(args):
         data_point = batch["input"]
         ray_origin = batch["ray_origin"]
         ray_direction = batch["ray_direction"]
+        cam_coords = batch["cam_coords"]
 
         total_frames = data_point.shape[1]
         past_frames = torch.stack([data_point[0, :int(total_frames / 2), ...]] * 5)
@@ -306,6 +319,7 @@ def main(args):
 
         masked_indices = np.array([i for i in range(args.n_input + args.n_output) if i not in unmasked_indices.tolist()])
         prediction = torch.from_numpy(prediction).permute(0, 3, 1, 2)
+        B, T, H, W = prediction.shape
 
         count += 1
 
@@ -320,6 +334,51 @@ def main(args):
                 colored_images.append((colored_image * 255).astype(np.uint8))
             os.makedirs(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals", exist_ok=True)
             make_gif(colored_images, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals/2d_{count}.gif", duration=100)
+
+
+        if args.visualize_3d:
+            all_points = []
+            all_colors = []
+            all_edges = []
+            i = 0
+            for framenumber in range(prediction.shape[1]):
+                ro = ray_origin[0, framenumber, ...].numpy().reshape(1, 3)
+                rd = ray_direction[0, framenumber, ...].numpy().reshape(H, W, 3)
+                cc = cam_coords[0, framenumber, ...].numpy().reshape(H, W, 3)
+                scene_coords = rd * np.array(prediction[0, framenumber, ...]) * args.scale_factor
+                corners = np.array([rd[0, 0], rd[0, W-1], rd[H-1, 0], rd[H-1, W-1]])
+
+                # append all the predicted points in 3D
+                all_points.append(scene_coords.reshape(-1, 3))
+                all_colors.append(np.ones_like(all_points[-1]) * 255)
+                i += all_points[-1].shape[0]
+
+                # append all the predicted points in 2D as a depth map
+                all_points.append(rd.reshape(-1, 3))
+                all_colors.append(np.concatenate([np.array(prediction[0, framenumber, ...]).reshape(-1, 1)] * 3, axis=1))
+                i += all_points[-1].shape[0]
+
+                # append all the image corners
+                all_points.append(corners)
+                all_colors.append(np.ones_like(all_points[-1]) * 255)
+                i += all_points[-1].shape[0]
+
+                # append the camera center
+                all_points.append(ro)
+                all_colors.append(np.ones_like(all_points[-1]) * 255)
+                i += all_points[-1].shape[0]
+
+                # append the 4 edges between the camera center and the corners of the image
+                all_edges.append(np.array([i-1, i-2]))
+                all_edges.append(np.array([i-1, i-3]))
+                all_edges.append(np.array([i-1, i-4]))
+                all_edges.append(np.array([i-1, i-5]))
+
+            all_points = np.concatenate(all_points, axis=0)
+            all_colors = np.concatenate(all_colors, axis=0)
+            all_edges = np.concatenate(all_edges, axis=0)
+
+            write_pointcloud(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals/3d_{count}.ply", all_points, all_colors, edges=all_edges)
 
 
 if __name__ == "__main__":
