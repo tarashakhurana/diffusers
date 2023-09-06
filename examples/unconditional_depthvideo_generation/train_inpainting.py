@@ -192,7 +192,7 @@ def parse_args():
             " process."
         ),
     )
-    parser.add_argument("--num_epochs", type=int, default=100)
+    parser.add_argument("--num_epochs", type=int, default=500)
     parser.add_argument("--save_images_epochs", type=int, default=10000000000000000, help="How often to save images during training.")
     parser.add_argument(
         "--save_model_epochs", type=int, default=10, help="How often to save the model during training."
@@ -878,7 +878,7 @@ def main(args):
                     np.random.choice(args.n_input + args.n_output, size=(num_masks, ), replace=False)
                 )
                 if args.masking_strategy == "half":
-                    time_indices = torch.arange(self.n_input, self.n_input + self.n_output, 1)
+                    time_indices = torch.arange(args.n_input, args.n_input + args.n_output, 1)
                 mask_images = torch.zeros_like(clean_images[:, :, 0, :, :]) # 4d
                 mask_images[:, time_indices, ...] = torch.ones_like(clean_images[:, time_indices, 0, ...])
                 clean_depths_masked = clean_depths * (1 - mask_images)

@@ -99,6 +99,8 @@ class DDPMDepthPoseInpaintingPipeline(DiffusionPipeline):
         # set step values
         self.scheduler.set_timesteps(num_inference_steps)
 
+        print("inpainting image shape", inpainting_image.shape)
+
         for t in self.progress_bar(self.scheduler.timesteps):
             # 0. prepare the model inputs
             # if plucker coords == True then the inpainting image is a 5D tensor
@@ -114,6 +116,7 @@ class DDPMDepthPoseInpaintingPipeline(DiffusionPipeline):
             clean_depths = clean_images[:, :, 0, :, :]
 
             if self.train_with_plucker_coords:
+                print(image.shape, clean_images.shape)
                 noisy_images = torch.cat([image[:, :, None, :, :], clean_images[:, :, 1:, :, :]], dim=2)
             else:
                 noisy_images = image
@@ -138,7 +141,7 @@ class DDPMDepthPoseInpaintingPipeline(DiffusionPipeline):
                 if self.masking_strategy == "random-half":
                     num_masks = self.n_input
                 if user_num_masks is not None:
-                    args.num_masks = user_num_masks
+                    num_masks = user_num_masks
                 time_indices = torch.from_numpy(
                     np.random.choice(self.n_input + self.n_output, size=(num_masks, ), replace=False)
                 )
