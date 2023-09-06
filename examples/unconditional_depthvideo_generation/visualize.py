@@ -145,14 +145,6 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--visualize_2d",
-        default=False,
-        action="store_true",
-        help=(
-            "If you want the 2D visualization of the depth video."
-        ),
-    )
-    parser.add_argument(
         "--visualize_3d",
         default=False,
         action="store_true",

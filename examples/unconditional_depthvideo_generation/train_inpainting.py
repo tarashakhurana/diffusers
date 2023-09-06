@@ -3,6 +3,7 @@ import inspect
 import logging
 import math
 import os
+import json
 from pathlib import Path
 from typing import Optional
 
@@ -336,7 +337,6 @@ def parse_args():
     return args
 
 
-
 def get_full_repo_name(model_id: str, organization: Optional[str] = None, token: Optional[str] = None):
     if token is None:
         token = HfFolder.get_token()
@@ -349,6 +349,11 @@ def get_full_repo_name(model_id: str, organization: Optional[str] = None, token:
 
 def main(args):
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
+
+    # dump config
+    os.makedirs(args.output_dir, exist_ok=True)
+    with open(f"{args.output_dir}/config.json", "w") as f:
+        json.dump(args.__dict__, f, indent=4)
 
     accelerator_project_config = ProjectConfiguration(total_limit=args.checkpoints_total_limit)
 
