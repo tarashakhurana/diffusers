@@ -9,7 +9,7 @@ from diffusers import DDPMPipeline, DDPMDepthPoseInpaintingPipeline, DDPMInpaint
 from diffusers import DPMSolverMultistepScheduler, UNet2DModel, DDPMScheduler, DDPMConditioningScheduler
 import matplotlib.cm
 
-from data import OccfusionDataset
+from data import OccfusionDataset, collate_fn_depthpose, collate_fn_inpainting
 from utils import write_pointcloud
 
 
@@ -29,37 +29,6 @@ def compute_scale_and_shift(prediction, target, mask):
     x_0[valid] = (a_11[valid] * b_0[valid] - a_01[valid] * b_1[valid]) / det[valid]
     x_1[valid] = (-a_01[valid] * b_0[valid] + a_00[valid] * b_1[valid]) / det[valid]
     return x_0, x_1
-
-
-def collate_fn_depthpose(examples):
-    inputs = torch.stack([example["input"] for example in examples])
-    inputs = inputs.to(memory_format=torch.contiguous_format).float()
-
-    ray_origin = torch.stack([example["ray_origin"] for example in examples])
-    ray_origin = ray_origin.to(memory_format=torch.contiguous_format).float()
-
-    ray_direction = torch.stack([example["ray_direction"] for example in examples])
-    ray_direction = ray_direction.to(memory_format=torch.contiguous_format).float()
-
-    cam_coords = torch.stack([example["cam_coords"] for example in examples])
-    cam_coords = cam_coords.to(memory_format=torch.contiguous_format).float()
-
-    return {
-        "input": inputs,
-        "ray_origin": ray_origin,
-        "ray_direction": ray_direction,
-        "cam_coords": cam_coords
-    }
-
-
-def collate_fn_inpainting(examples):
-    inputs = torch.stack([example["input"] for example in examples])
-    inputs = inputs.to(memory_format=torch.contiguous_format).float()
-
-    return {
-        "input": inputs
-    }
-
 
 
 def make_gif(frames, save_path, duration):
