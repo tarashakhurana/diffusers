@@ -159,3 +159,62 @@ class HarmonicEmbedding(torch.nn.Module):
             input_dims, len(self._frequencies), self.append_input
         )
 
+
+def render_path_spiral(poses, focal, zrate=0.5, rots=2, N=120):
+    """
+        Construct a set of camera extrinsics that simulate the
+        NeRF-like spiral path for forward facing scenes.
+            poses: N x 3 x 5 array of poses
+            focal: focal length for a reasonable "focus-depth" for the dataset
+            zrate: rate of spiral along z-axis
+            rots: number of rotations around spiral
+            N: number of poses to sample
+    """
+    c2w = poses_avg(poses)
+    up = normalize(poses[:, :3, 1].sum(0))
+    tt = poses[:,:3,3]
+    rads = np.percentile(np.abs(tt), 90, 0)
+    render_poses = []
+    rads = np.array(list(rads) + [1.])
+    hwf = c2w[:,4:5]
+
+    for theta in np.linspace(0., 2. * np.pi * rots, N+1)[:-1]:
+        c = np.dot(c2w[:3,:4], np.array([np.cos(theta), -np.sin(theta), -np.sin(theta*zrate), 1.]) * rads)
+        z = normalize(c - np.dot(c2w[:3,:4], np.array([0,0,-focal, 1.])))
+        render_poses.append(np.concatenate([viewmatrix(z, up, c), hwf], 1))
+    return render_poses
+
+
+def poses_avg(poses):
+    """
+    Args:
+        poses: N x 4 x 4
+    """
+
+    hwf = poses[0, :3, -1:]
+
+    center = poses[:, :3, 3].mean(0)
+    vec2 = normalize(poses[:, :3, 2].sum(0))
+    up = poses[:, :3, 1].sum(0)
+    c2w = np.concatenate([viewmatrix(vec2, up, center), hwf], 1)
+
+    return c2w
+
+
+def normalize(x):
+    """ normalize a vector """
+    return x / np.linalg.norm(x)
+
+
+def viewmatrix(z, up, pos):
+    """
+        z: forward (1D vector with 3 entries)
+        up: up (1D vector with 3 entries)
+        pos: camera position (1D vector with 3 entries)
+    """
+    vec2 = normalize(z)
+    vec1_avg = up
+    vec0 = normalize(np.cross(vec1_avg, vec2))
+    vec1 = normalize(np.cross(vec2, vec0))
+    m = np.stack([vec0, vec1, vec2, pos], 1)
+    return m
