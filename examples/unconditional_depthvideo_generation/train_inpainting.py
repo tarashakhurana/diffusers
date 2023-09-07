@@ -12,6 +12,7 @@ import datasets
 import torch
 from copy import deepcopy
 from einops import repeat
+from torchsummary import summary
 import numpy as np
 import torch.nn.functional as F
 from PIL import Image
@@ -33,7 +34,7 @@ from diffusers.utils import check_min_version, is_accelerate_version, is_tensorb
 from diffusers.utils.import_utils import is_xformers_available
 
 from utils import HarmonicEmbedding, write_pointcloud
-from data import OccfusionDataset, collate_fn_depthpose
+from data import OccfusionDataset, collate_fn_depthpose, collate_fn_inpainting
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.16.0.dev0")
@@ -149,6 +150,8 @@ def parse_args():
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument("--overwrite_output_dir", action="store_true")
+    parser.add_argument("--bigger_model", action="store_true")
+    parser.add_argument("--use_harmonic", action="store_true")
     parser.add_argument(
         "--cache_dir",
         type=str,
@@ -194,7 +197,7 @@ def parse_args():
             " process."
         ),
     )
-    parser.add_argument("--num_epochs", type=int, default=500)
+    parser.add_argument("--num_epochs", type=int, default=600)
     parser.add_argument("--save_images_epochs", type=int, default=10000000000000000, help="How often to save images during training.")
     parser.add_argument(
         "--save_model_epochs", type=int, default=10, help="How often to save the model during training."
@@ -442,28 +445,48 @@ def main(args):
 
     # Initialize the model
     if args.model_config_name_or_path is None:
+        if args.bigger_model:
+            block_out_channels=(128, 256, 256, 512)
+            down_block_types = (
+                "AttnDownBlock2D",
+                "AttnDownBlock2D",
+                "AttnDownBlock2D",
+                "DownBlock2D",
+            )
+            up_block_types = (
+                "UpBlock2D",
+                "AttnUpBlock2D",
+                "AttnUpBlock2D",
+                "AttnUpBlock2D",
+            )
+        else:
+            block_out_channels=(128, 256, 512)
+            down_block_types = (
+                "AttnDownBlock2D",
+                "AttnDownBlock2D",
+                "DownBlock2D",
+            )
+            up_block_types = (
+                "UpBlock2D",
+                "AttnUpBlock2D",
+                "AttnUpBlock2D",
+            )
+
         model = UNet2DModel(
             sample_size=args.resolution,
             in_channels=args.in_channels,
             out_channels=args.out_channels,
             layers_per_block=2,
-            block_out_channels=(128, 256, 256, 512),
-            down_block_types=(
-                "AttnDownBlock2D",
-                "AttnDownBlock2D",
-                "AttnDownBlock2D",
-                "DownBlock2D",
-            ),
-            up_block_types=(
-                "UpBlock2D",
-                "AttnUpBlock2D",
-                "AttnUpBlock2D",
-                "AttnUpBlock2D",
-            ),
+            block_out_channels=block_out_channels,
+            down_block_types=down_block_types,
+            up_block_types=up_block_types,
         )
     else:
         config = UNet2DModel.load_config(args.model_config_name_or_path)
         model = UNet2DModel.from_config(config)
+
+    print("Total number of parameters in model", model.num_parameters(only_trainable=True))
+    print(summary(model))
 
     # Create EMA for the model.
     if args.use_ema:
@@ -518,15 +541,20 @@ def main(args):
         offset=args.offset,
         normalization_factor=args.normalization_factor,
         plucker_coords=args.train_with_plucker_coords,
-        use_harmonic=False,
+        use_harmonic=args.use_harmonic,
         visualize=False
     )
+
+    if args.train_with_plucker_coords:
+        collate_fn = collate_fn_depthpose
+    else:
+        collate_fn = collate_fn_inpainting
 
     train_dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=args.train_batch_size,
         shuffle=True,
-        collate_fn=collate_fn_depthpose,
+        collate_fn=collate_fn,
         num_workers=args.dataloader_num_workers,
     )
 

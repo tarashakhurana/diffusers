@@ -230,15 +230,6 @@ class PointOdysseyDepthDataset(Dataset):
         return example
 
 
-def collate_fn(examples):
-    inputs = torch.stack([example["input"] for example in examples])
-    inputs = inputs.to(memory_format=torch.contiguous_format).float()
-
-    return {
-        "input": inputs,
-    }
-
-
 def collate_fn_depthpose(examples):
     inputs = torch.stack([example["input"] for example in examples])
     inputs = inputs.to(memory_format=torch.contiguous_format).float()
@@ -445,7 +436,7 @@ class OccfusionDataset(Dataset):
                 # cam_coords /= cam_coords[:, :, 2:]
                 # cam_ray_dirs = F.normalize(cam_coords, dim=0)
                 ray_dirs_unnormalized = Rt_inv @ cam_coords_homo
-                ray_dirs_unnormalized = ray_dirs_unnormalized[:3, :] - ray_origins
+                ray_dirs_unnormalized = ray_dirs_unnormalized[:3, :] - ray_origins.T
                 ray_dirs = ray_dirs_unnormalized.T / torch.norm(ray_dirs_unnormalized.T, dim=-1, keepdim=True)
                 plucker_rays = self.encode_plucker(ray_origins, ray_dirs, use_harmonic=self.use_harmonic)
                 plucker_map = plucker_rays.reshape(H, W, -1).permute(2, 0, 1)
