@@ -52,6 +52,7 @@ class DDPMDepthPoseInpaintingPipeline(DiffusionPipeline):
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
         user_num_masks=None,
+        user_time_indices=None,
     ) -> Union[ImagePipelineOutput, Tuple]:
         r"""
         Args:
@@ -147,6 +148,8 @@ class DDPMDepthPoseInpaintingPipeline(DiffusionPipeline):
                 )
                 if self.masking_strategy == "half":
                     time_indices = torch.arange(self.n_input, self.n_input + self.n_output, 1)
+                if user_time_indices is not None:
+                    time_indices = user_time_indices
                 time_indices_unmasked = torch.Tensor([i for i in range(self.n_output + self.n_input) if i not in time_indices])
                 mask_images = torch.zeros_like(clean_images[:, :, 0, :, :])  # 4d
                 mask_images[:, time_indices, ...] = torch.ones_like(clean_images[:, time_indices, 0, ...])

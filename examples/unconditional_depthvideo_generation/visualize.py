@@ -1,4 +1,6 @@
 import os
+
+from matplotlib.cbook import time
 import torch
 import inspect
 import argparse
@@ -10,7 +12,7 @@ from diffusers import DPMSolverMultistepScheduler, UNet2DModel, DDPMScheduler, D
 import matplotlib.cm
 
 from data import OccfusionDataset, collate_fn_depthpose, collate_fn_inpainting
-from utils import write_pointcloud
+from utils import render_path_spiral, write_pointcloud
 
 
 def compute_scale_and_shift(prediction, target, mask):
@@ -153,6 +155,14 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--visualize_spiral",
+        default=False,
+        action="store_true",
+        help=(
+            "If you want to render additional poses around a single timestep in a spiral."
+        ),
+    )
+    parser.add_argument(
         "--train_with_plucker_coords",
         default=False,
         action="store_true",
@@ -205,6 +215,7 @@ def parse_args():
     )
     parser.add_argument("--ddpm_num_steps", type=int, default=1000)
     parser.add_argument("--ddpm_num_inference_steps", type=int, default=1000)
+    parser.add_argument("--num_inference_steps", type=int, default=40)
     parser.add_argument("--ddpm_beta_schedule", type=str, default="linear")
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -231,7 +242,8 @@ def main(args):
         normalization_factor=args.normalization_factor,
         plucker_coords=args.train_with_plucker_coords,
         use_harmonic=False,
-        visualize=False
+        visualize=False,
+        spiral_poses=args.visualize_spiral,
     )
 
     assert args.eval_batch_size == 1, "eval batch size must be 1"
@@ -293,13 +305,25 @@ def main(args):
             cam_coords = batch["cam_coords"]
 
         total_frames = data_point.shape[1]
-        past_frames = torch.stack([data_point[0, :int(total_frames / 2), ...]] * 5)
-        future_frames = torch.stack([data_point[0, int(total_frames / 2):, ...]] * 5)
+        past_frames = torch.stack([data_point[0, :int(total_frames / 2), ...]] * 1)
+        future_frames = torch.stack([data_point[0, int(total_frames / 2):, ...]] * 1)
+
+        if args.visualize_spiral:
+            assert data_point.shape[0] == 1, "only works for batch size 1"
+            assert args.masking_strategy == "random", "only works for random masking strategy"
+            # we always only visualize the 6th timestep in a spiral
+            time_indices = [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11]
+            args.num_masks = 11
+            batch_size = 12
+            data_point = data_point[0]
+        else:
+            time_indices = None
+            batch_size = 1
 
         if args.model_type == "reconstruction":
             prediction = pipeline(
-                    batch_size=5,
-                    num_inference_steps=40,
+                    batch_size=batch_size
+                    num_inference_steps=args.num_inference_steps,
                     cond_inds=torch.arange(int(total_frames / 2)),
                     recon_scale=10,
                     conditioning=past_frames,
@@ -307,18 +331,20 @@ def main(args):
         elif args.model_type == "inpainting":
             prediction, unmasked_indices = pipeline(
                     inpainting_image=data_point,
-                    batch_size=1,
-                    num_inference_steps=40,
+                    batch_size=batch_size,
+                    num_inference_steps=args.num_inference_steps,
                     output_type="numpy").images
             masked_indices = np.array([i for i in range(args.n_input + args.n_output) if i not in unmasked_indices.tolist()])
         elif args.model_type == "depthpose":
             print("getting predictions using args.num_masks", args.num_masks)
             prediction, unmasked_indices = pipeline(
                     inpainting_image=data_point,
-                    batch_size=1,
-                    num_inference_steps=40,
+                    batch_size=batch_size,
+                    num_inference_steps=args.num_inference_steps,
                     output_type="numpy",
-                    user_num_masks=args.num_masks).images
+                    user_num_masks=args.num_masks,
+                    user_time_indices=time_indices,
+                ).images
             masked_indices = np.array([i for i in range(args.n_input + args.n_output) if i not in unmasked_indices.tolist()])
 
         prediction = torch.from_numpy(prediction).permute(0, 3, 1, 2)

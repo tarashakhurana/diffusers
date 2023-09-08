@@ -2,6 +2,18 @@ import torch
 import struct
 import numpy as np
 
+from einops import repeat
+
+
+def encode_plucker(ray_origins, ray_dirs, harmonic_embedding=None):
+    """
+    ray to plucker w/ pos encoding
+    """
+    plucker = torch.cat((ray_dirs, torch.cross(ray_origins, ray_dirs, dim=-1)), dim=-1)
+    if harmonic_embedding is not None:
+        plucker = harmonic_embedding(plucker)
+    return plucker
+
 
 def write_pointcloud(filename,xyz_points,rgb_points=None, edges=None):
 
@@ -172,15 +184,15 @@ def render_path_spiral(poses, focal, zrate=0.5, rots=2, N=120):
     """
     c2w = poses_avg(poses)
     up = normalize(poses[:, :3, 1].sum(0))
-    tt = poses[:,:3,3]
+    tt = poses[:, :3, 3]
     rads = np.percentile(np.abs(tt), 90, 0)
     render_poses = []
     rads = np.array(list(rads) + [1.])
-    hwf = c2w[:,4:5]
+    hwf = c2w[:, 4:5]
 
     for theta in np.linspace(0., 2. * np.pi * rots, N+1)[:-1]:
-        c = np.dot(c2w[:3,:4], np.array([np.cos(theta), -np.sin(theta), -np.sin(theta*zrate), 1.]) * rads)
-        z = normalize(c - np.dot(c2w[:3,:4], np.array([0,0,-focal, 1.])))
+        c = np.dot(c2w[:3, :4], np.array([np.cos(theta), -np.sin(theta), -np.sin(theta * zrate), 1.]) * rads)
+        z = normalize(c - np.dot(c2w[:3, :4], np.array([0, 0, -focal, 1.])))
         render_poses.append(np.concatenate([viewmatrix(z, up, c), hwf], 1))
     return render_poses
 
@@ -218,3 +230,20 @@ def viewmatrix(z, up, pos):
     vec1 = normalize(np.cross(vec2, vec0))
     m = np.stack([vec0, vec1, vec2, pos], 1)
     return m
+
+
+def get_plucker(K, Rt, H, W):
+    Rt_inv = torch.linalg.inv(Rt)
+    v, u = torch.meshgrid(torch.arange(int(H), torch.arange(W)), indexing="ij")
+    u = W - u - 1
+    uv_homo = torch.stack([u, v, torch.ones_like(v)]).float()
+    cam_coords = torch.linalg.inv(K) @ uv_homo.reshape(3, -1)
+    cam_coords_homo = torch.cat([torch.ones((1, cam_coords.shape[1])), cam_coords], dim=0)
+
+    ray_origins = repeat(Rt_inv[:3, 3], 'c -> c n', n=cam_coords_homo.shape[1]).T
+
+    ray_dirs_unnormalized = Rt_inv @ cam_coords_homo
+    ray_dirs_unnormalized = ray_dirs_unnormalized[:3, :] - ray_origins.T
+    ray_dirs = ray_dirs_unnormalized.T / torch.norm(ray_dirs_unnormalized.T, dim=-1, keepdim=True)
+
+    return ray_origins, ray_dirs
