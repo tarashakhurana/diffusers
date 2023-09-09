@@ -237,17 +237,15 @@ def collate_fn_depthpose(examples):
     ray_origin = torch.stack([example["ray_origin"] for example in examples])
     ray_origin = ray_origin.to(memory_format=torch.contiguous_format).float()
 
-    ray_direction = torch.stack([example["ray_direction"] for example in examples])
-    ray_direction = ray_direction.to(memory_format=torch.contiguous_format).float()
+    # ray_direction = torch.stack([example["ray_direction"] for example in examples])
+    # ray_direction = ray_direction.to(memory_format=torch.contiguous_format).float()
 
-    cam_coords = torch.stack([example["cam_coords"] for example in examples])
-    cam_coords = cam_coords.to(memory_format=torch.contiguous_format).float()
+    # cam_coords = torch.stack([example["cam_coords"] for example in examples])
+    # cam_coords = cam_coords.to(memory_format=torch.contiguous_format).float()
 
     return {
         "input": inputs,
         "ray_origin": ray_origin,
-        "ray_direction": ray_direction,
-        "cam_coords": cam_coords
     }
 
 
@@ -415,7 +413,7 @@ class OccfusionDataset(Dataset):
 
             depth_preprocessed = self.image_transforms(Image.fromarray(depth.astype("uint8"))).squeeze()
             scale = depth_preprocessed.shape[0] / depth.shape[0]
-            H, W = depth.shape * scale
+            H, W = depth.shape[0] * scale, depth.shape[1] * scale
             H, W = int(H), int(W)
 
             if self.plucker_coords:
@@ -433,10 +431,10 @@ class OccfusionDataset(Dataset):
                 depth_with_plucker_map = torch.cat([depth_preprocessed[None, ...], plucker_map], dim=0)
 
                 depth_frames.append(depth_with_plucker_map)
-                ray_dirs_preprocess = transforms.CenterCrop(self.size)(ray_dirs_unnormalized[:3, :].reshape(3, H, W)).permute(1, 2, 0).reshape(-1, 3)
+                # ray_dirs_preprocess = transforms.CenterCrop(self.size)(ray_dirs_unnormalized[:3, :].reshape(3, H, W)).permute(1, 2, 0).reshape(-1, 3)
                 all_ray_origin.append(ray_origins[0][None, :])
-                all_ray_dirs_unnormalized.append(ray_dirs_preprocess)
-                all_cam_coords.append(cam_coords.T)
+                # all_ray_dirs_unnormalized.append(ray_dirs_preprocess)
+                # all_cam_coords.append(cam_coords.T)
                 all_rt.append(Rt)
                 all_k.append(K)
 
@@ -455,22 +453,26 @@ class OccfusionDataset(Dataset):
 
         if self.plucker_coords:
             all_ray_origin = torch.stack(all_ray_origin, axis=0)
-            all_ray_dirs_unnormalized = torch.stack(all_ray_dirs_unnormalized, axis=0)
-            all_cam_coords = torch.stack(all_cam_coords, axis=0)
+            # all_ray_dirs_unnormalized = torch.stack(all_ray_dirs_unnormalized, axis=0)
+            # all_cam_coords = torch.stack(all_cam_coords, axis=0)
 
-        if self.spiral_poses:
-            middle_pose = np.zeros((1, 3, 5))
-            middle_K = all_k[6]
-            middle_pose[0, :3, :4] = all_rt[6][:3, :4]
-            middle_pose[0, :, 4] = np.array([H, W, middle_K[6][0,0]])
-            render_poses = np.stack(utils.render_path_spiral(middle_pose, 3.0, N = 12))
-            render_poses = render_poses[:, :3, :4]
-            for p in range(12):
-                render_ray_origins, render_ray_dirs = utils.get_plucker(middle_K, render_poses[p], H, W)
-                render_plucker_rays = utils.encode_plucker(render_ray_origins, render_ray_dirs)
-                render_plucker_map = transforms.CenterCrop(self.size)(render_plucker_rays.reshape(H, W, -1).permute(2, 0, 1))
-                depth_video = depth_video.unsqueeze(0).repeat(12, 1, 1, 1)
-                depth_video[p, 1:, ...] = render_plucker_map
+            if self.spiral_poses:
+                middle_pose = np.zeros((1, 3, 5))
+                middle_K = all_k[6]
+                mp = torch.linalg.inv(all_rt[6])
+                middle_pose[0, :3, :4] = mp[:3, :4]
+                middle_pose[0, :, 4] = np.array([H, W, middle_K[0,0]])
+                render_poses = np.stack(utils.render_path_spiral(middle_pose, 3.0, N = 12))
+                render_poses = torch.from_numpy(render_poses[:, :3, :4])
+                depth_video = depth_video.unsqueeze(0).repeat(12, 1, 1, 1, 1)
+                print(render_poses[:, :3, 3], middle_pose[:, :3, 3])
+                for p in range(12):
+                    pose = render_poses[p]
+                    pose_homo = torch.cat([pose, torch.Tensor([[0.0, 0.0, 0.0, 1.0]])], dim=0).float()
+                    render_ray_origins, render_ray_dirs = utils.get_plucker(middle_K, torch.linalg.inv(pose_homo), H, W)
+                    render_plucker_rays = utils.encode_plucker(render_ray_origins, render_ray_dirs)
+                    render_plucker_map = transforms.CenterCrop(self.size)(render_plucker_rays.reshape(H, W, -1).permute(2, 0, 1))
+                    depth_video[p, 6, 1:, ...] = render_plucker_map
 
         if self.visualize:
             all_points = np.concatenate(all_points, axis=0)
@@ -481,6 +483,6 @@ class OccfusionDataset(Dataset):
         example["input"] = depth_video  # video is of shape T x H x W or T x C x H x W
         if self.plucker_coords:
             example["ray_origin"] = all_ray_origin
-            example["ray_direction"] = all_ray_dirs_unnormalized
-            example["cam_coords"] = all_cam_coords
+            # example["ray_direction"] = all_ray_dirs_unnormalized
+            # example["cam_coords"] = all_cam_coords
         return example

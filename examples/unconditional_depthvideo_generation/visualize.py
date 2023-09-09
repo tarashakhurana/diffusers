@@ -298,11 +298,15 @@ def main(args):
     count = 0
 
     for b, batch in enumerate(eval_dataloader):
+
+        # if b != 3:
+        #     continue
+
         data_point = batch["input"]
         if args.train_with_plucker_coords:
             ray_origin = batch["ray_origin"]
-            ray_direction = batch["ray_direction"]
-            cam_coords = batch["cam_coords"]
+            # ray_direction = batch["ray_direction"]
+            # cam_coords = batch["cam_coords"]
 
         total_frames = data_point.shape[1]
         past_frames = torch.stack([data_point[0, :int(total_frames / 2), ...]] * 1)
@@ -312,17 +316,19 @@ def main(args):
             assert data_point.shape[0] == 1, "only works for batch size 1"
             assert args.masking_strategy == "random", "only works for random masking strategy"
             # we always only visualize the 6th timestep in a spiral
-            time_indices = [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11]
-            args.num_masks = 11
+            time_indices = [6]
+            args.num_masks = 1
             batch_size = 12
             data_point = data_point[0]
+            print(data_point[0, 6, 1, 0, :], data_point[1, 6, 1, 0, :])
         else:
-            time_indices = None
+            time_indices = [6]
+            args.num_masks = 1
             batch_size = 1
 
         if args.model_type == "reconstruction":
             prediction = pipeline(
-                    batch_size=batch_size
+                    batch_size=batch_size,
                     num_inference_steps=args.num_inference_steps,
                     cond_inds=torch.arange(int(total_frames / 2)),
                     recon_scale=10,
@@ -333,7 +339,9 @@ def main(args):
                     inpainting_image=data_point,
                     batch_size=batch_size,
                     num_inference_steps=args.num_inference_steps,
-                    output_type="numpy").images
+                    output_type="numpy",
+                    user_num_masks=args.num_masks,
+                    user_time_indices=time_indices).images
             masked_indices = np.array([i for i in range(args.n_input + args.n_output) if i not in unmasked_indices.tolist()])
         elif args.model_type == "depthpose":
             print("getting predictions using args.num_masks", args.num_masks)
@@ -350,8 +358,6 @@ def main(args):
         prediction = torch.from_numpy(prediction).permute(0, 3, 1, 2)
         B, T, H, W = prediction.shape
 
-        count += 1
-
         colored_images = []
 
         if args.visualize_3d:
@@ -360,67 +366,75 @@ def main(args):
             all_edges = []
             i = 0
 
-        for framenumber in range(prediction.shape[1]):
-            prediction_minmax = (prediction[0, framenumber] - prediction[0, framenumber].min()) / (prediction[0, framenumber].max() - prediction[0, framenumber].min())
-            if framenumber in masked_indices:
-                cmap = matplotlib.cm.get_cmap('inferno')
-            else:
-                cmap = matplotlib.cm.get_cmap('gray')
-            colored_image = cmap(prediction_minmax)
-            colored_images.append(Image.fromarray((colored_image * 255).astype(np.uint8)))
+        for b in range(prediction.shape[0]):
+            count += 1
+            spiral = []
+            for framenumber in range(prediction.shape[1]):
+                prediction_minmax = (prediction[b, framenumber] - prediction[b, framenumber].min()) / (prediction[b, framenumber].max() - prediction[b, framenumber].min())
+                if framenumber in masked_indices:
+                    cmap = matplotlib.cm.get_cmap('inferno')
+                else:
+                    cmap = matplotlib.cm.get_cmap('gray')
+                colored_image = cmap(prediction_minmax)
+                colored_images.append(Image.fromarray((colored_image * 255).astype(np.uint8)))
+
+                if args.visualize_3d:
+                    ro = ray_origin[b, framenumber, ...].numpy().reshape(1, 3)
+                    rd = ray_direction[b, framenumber, ...].numpy().reshape(H, W, 3)
+                    scene_coords = rd * np.array(prediction[b, framenumber, ..., None]) * args.scale_factor
+                    prediction_minmax = (prediction[b, framenumber] - prediction[b, framenumber].min()) / (prediction[b, framenumber].max() - prediction[b, framenumber].min())
+                    corners = np.array([rd[0, 0], rd[0, W-1], rd[H-1, 0], rd[H-1, W-1]])
+
+                    # append all the predicted points in 3D
+                    all_points.append(scene_coords.reshape(-1, 3))
+                    all_colors.append(colored_image[..., :3].reshape(-1, 3))
+                    i += all_points[-1].shape[0]
+
+                    # print("1", all_points[-1].shape, all_colors[-1].shape)
+
+                    # append all the predicted points in 2D as a depth map
+                    all_points.append(rd.reshape(-1, 3))
+                    all_colors.append(colored_image[..., :3].reshape(-1, 3))
+                    i += all_points[-1].shape[0]
+                    # print("2", all_points[-1].shape, all_colors[-1].shape)
+
+                    # append all the image corners
+                    all_points.append(corners)
+                    all_colors.append(np.ones_like(all_points[-1]) * 255)
+                    i += all_points[-1].shape[0]
+                    # print("3", all_points[-1].shape, all_colors[-1].shape)
+
+                    # append the camera center
+                    all_points.append(ro)
+                    color = np.ones_like(all_points[-1]) * 255
+                    if framenumber in masked_indices:
+                        color[:, :2] = 0
+                    else:
+                        color[:, 1:] = 0
+                    all_colors.append(color)
+                    i += all_points[-1].shape[0]
+                    # print("4", all_points[-1].shape, all_colors[-1].shape)
+
+                    # append the 4 edges between the camera center and the corners of the image
+                    all_edges.append(np.array([i-1, i-2]))
+                    all_edges.append(np.array([i-1, i-3]))
+                    all_edges.append(np.array([i-1, i-4]))
+                    all_edges.append(np.array([i-1, i-5]))
+
 
             if args.visualize_3d:
-                ro = ray_origin[0, framenumber, ...].numpy().reshape(1, 3)
-                rd = ray_direction[0, framenumber, ...].numpy().reshape(H, W, 3)
-                scene_coords = rd * np.array(prediction[0, framenumber, ..., None]) * args.scale_factor
-                prediction_minmax = (prediction[0, framenumber] - prediction[0, framenumber].min()) / (prediction[0, framenumber].max() - prediction[0, framenumber].min())
-                corners = np.array([rd[0, 0], rd[0, W-1], rd[H-1, 0], rd[H-1, W-1]])
+                all_points = np.concatenate(all_points, axis=0)
+                all_colors = np.concatenate(all_colors, axis=0)
+                all_edges = np.stack(all_edges, axis=0)
+                write_pointcloud(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals/3d_{count}.ply", all_points, all_colors, edges=all_edges)
 
-                # append all the predicted points in 3D
-                all_points.append(scene_coords.reshape(-1, 3))
-                all_colors.append(colored_image[..., :3].reshape(-1, 3))
-                i += all_points[-1].shape[0]
+            os.makedirs(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals", exist_ok=True)
+            make_gif(colored_images, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals/2d_{count}.gif", duration=800)
 
-                # print("1", all_points[-1].shape, all_colors[-1].shape)
+            spiral.append(colored_images[6])
 
-                # append all the predicted points in 2D as a depth map
-                all_points.append(rd.reshape(-1, 3))
-                all_colors.append(colored_image[..., :3].reshape(-1, 3))
-                i += all_points[-1].shape[0]
-                # print("2", all_points[-1].shape, all_colors[-1].shape)
-
-                # append all the image corners
-                all_points.append(corners)
-                all_colors.append(np.ones_like(all_points[-1]) * 255)
-                i += all_points[-1].shape[0]
-                # print("3", all_points[-1].shape, all_colors[-1].shape)
-
-                # append the camera center
-                all_points.append(ro)
-                color = np.ones_like(all_points[-1]) * 255
-                if framenumber in masked_indices:
-                    color[:, :2] = 0
-                else:
-                    color[:, 1:] = 0
-                all_colors.append(color)
-                i += all_points[-1].shape[0]
-                # print("4", all_points[-1].shape, all_colors[-1].shape)
-
-                # append the 4 edges between the camera center and the corners of the image
-                all_edges.append(np.array([i-1, i-2]))
-                all_edges.append(np.array([i-1, i-3]))
-                all_edges.append(np.array([i-1, i-4]))
-                all_edges.append(np.array([i-1, i-5]))
-
-
-        if args.visualize_3d:
-            all_points = np.concatenate(all_points, axis=0)
-            all_colors = np.concatenate(all_colors, axis=0)
-            all_edges = np.stack(all_edges, axis=0)
-            write_pointcloud(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals/3d_{count}.ply", all_points, all_colors, edges=all_edges)
-
-        os.makedirs(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals", exist_ok=True)
-        make_gif(colored_images, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals/2d_{count}.gif", duration=800)
+        if args.visualize_spiral:
+            make_gif(spiral, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals/spiral_{count}.gif", duration=800)
 
 
 if __name__ == "__main__":

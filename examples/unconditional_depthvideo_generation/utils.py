@@ -234,7 +234,7 @@ def viewmatrix(z, up, pos):
 
 def get_plucker(K, Rt, H, W):
     Rt_inv = torch.linalg.inv(Rt)
-    v, u = torch.meshgrid(torch.arange(int(H), torch.arange(W)), indexing="ij")
+    v, u = torch.meshgrid(torch.arange(H), torch.arange(W), indexing="ij")
     u = W - u - 1
     uv_homo = torch.stack([u, v, torch.ones_like(v)]).float()
     cam_coords = torch.linalg.inv(K) @ uv_homo.reshape(3, -1)
