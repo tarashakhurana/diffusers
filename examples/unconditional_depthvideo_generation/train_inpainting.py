@@ -177,6 +177,23 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--loss_only_on_masked",
+        default=False,
+        action="store_true",
+        help=(
+            "Whether to compute the loss only on the masked region. If not set, the loss will be computed on the"
+            " entire sequence."
+        ),
+    )
+    parser.add_argument(
+        "--loss_in_3d",
+        default=False,
+        action="store_true",
+        help=(
+            "If you want the loss to be computed in 3D space. If not set, the loss will be computed in 2D space."
+        ),
+    )
+    parser.add_argument(
         "--random_flip",
         default=False,
         action="store_true",
@@ -697,6 +714,11 @@ def main(args):
                 # Predict the noise residual
                 # timesteps_unet = torch.zeros((bsz,), device=clean_images.device).long()
                 model_output = model(model_inputs, timesteps).sample
+
+                if args.loss_only_on_masked:
+                    model_output = model_output[:, time_indices, ...]
+                    noise = noise[:, time_indices, ...]
+                    clean_depths = clean_depths[:, time_indices, ...]
 
                 if args.prediction_type == "epsilon":
                     loss = F.mse_loss(model_output, noise)  # this could have different weights!
