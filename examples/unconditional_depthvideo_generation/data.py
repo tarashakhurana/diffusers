@@ -237,6 +237,9 @@ def collate_fn_depthpose(examples):
     ray_origin = torch.stack([example["ray_origin"] for example in examples])
     ray_origin = ray_origin.to(memory_format=torch.contiguous_format).float()
 
+    image_plane_in_3d = torch.stack([example["image_plane_in_3d"] for example in examples])
+    image_plane_in_3d = image_plane_in_3d.to(memory_format=torch.contiguous_format).float()
+
     # ray_direction = torch.stack([example["ray_direction"] for example in examples])
     # ray_direction = ray_direction.to(memory_format=torch.contiguous_format).float()
 
@@ -246,6 +249,7 @@ def collate_fn_depthpose(examples):
     return {
         "input": inputs,
         "ray_origin": ray_origin,
+        "image_plane_in_3d": image_plane_in_3d,
     }
 
 
@@ -388,6 +392,7 @@ class OccfusionDataset(Dataset):
         all_ray_dirs_unnormalized = []
         all_cam_coords = []
         all_rt = []
+        all_image_plane_in_3d = []
         all_k = []
 
         if self.visualize:
@@ -425,21 +430,23 @@ class OccfusionDataset(Dataset):
 
                 Rt = self.extrinsics[ref_index - i]
 
-                ray_origins, ray_dirs = utils.get_plucker(K, Rt, H, W)
+                ray_origins, ray_dirs, image_plane_in_3d = utils.get_plucker(K, Rt, H, W, return_image_plane=True)
                 plucker_rays = utils.encode_plucker(ray_origins, ray_dirs)
                 plucker_map = transforms.CenterCrop(self.size)(plucker_rays.reshape(H, W, -1).permute(2, 0, 1))
+                image_plane_in_3d = transforms.CenterCrop(self.size)(image_plane_in_3d.reshape(H, W, -1).permute(2, 0, 1))
                 depth_with_plucker_map = torch.cat([depth_preprocessed[None, ...], plucker_map], dim=0)
 
                 depth_frames.append(depth_with_plucker_map)
                 # ray_dirs_preprocess = transforms.CenterCrop(self.size)(ray_dirs_unnormalized[:3, :].reshape(3, H, W)).permute(1, 2, 0).reshape(-1, 3)
                 all_ray_origin.append(ray_origins[0][None, :])
+                all_image_plane_in_3d.append(image_plane_in_3d)
                 # all_ray_dirs_unnormalized.append(ray_dirs_preprocess)
                 # all_cam_coords.append(cam_coords.T)
                 all_rt.append(Rt)
                 all_k.append(K)
 
                 if self.visualize:
-                    all_points.append(np.concatenate([Rt_inv[:3, 3:].T, ray_dirs.numpy().T], axis=0))
+                    all_points.append(np.concatenate([Rt_inv[:3, 3:].T, image_plane_in_3d.numpy().T], axis=0))
                     edges = np.arange(all_points[-1].shape[0]) + 1 + offset
                     edges = np.hstack([np.zeros((all_points[-1].shape[0], 1)) + offset, edges[:, None]])
                     all_edges.append(edges.astype(int))
@@ -453,6 +460,7 @@ class OccfusionDataset(Dataset):
 
         if self.plucker_coords:
             all_ray_origin = torch.stack(all_ray_origin, axis=0)
+            all_image_plane_in_3d = torch.stack(all_image_plane_in_3d, axis=0)
             # all_ray_dirs_unnormalized = torch.stack(all_ray_dirs_unnormalized, axis=0)
             # all_cam_coords = torch.stack(all_cam_coords, axis=0)
 
@@ -483,6 +491,7 @@ class OccfusionDataset(Dataset):
         example["input"] = depth_video  # video is of shape T x H x W or T x C x H x W
         if self.plucker_coords:
             example["ray_origin"] = all_ray_origin
+            example["image_plane_in_3d"] = all_image_plane_in_3d
             # example["ray_direction"] = all_ray_dirs_unnormalized
             # example["cam_coords"] = all_cam_coords
         return example

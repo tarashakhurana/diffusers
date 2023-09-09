@@ -232,7 +232,7 @@ def viewmatrix(z, up, pos):
     return m
 
 
-def get_plucker(K, Rt, H, W):
+def get_plucker(K, Rt, H, W, return_image_plane=False):
     Rt_inv = torch.linalg.inv(Rt)
     v, u = torch.meshgrid(torch.arange(H), torch.arange(W), indexing="ij")
     u = W - u - 1
@@ -243,7 +243,10 @@ def get_plucker(K, Rt, H, W):
     ray_origins = repeat(Rt_inv[:3, 3], 'c -> c n', n=cam_coords_homo.shape[1]).T
 
     ray_dirs_unnormalized = Rt_inv @ cam_coords_homo
-    ray_dirs_unnormalized = ray_dirs_unnormalized[:3, :] - ray_origins.T
-    ray_dirs = ray_dirs_unnormalized.T / torch.norm(ray_dirs_unnormalized.T, dim=-1, keepdim=True)
+    ray_dirs_centered = ray_dirs_unnormalized[:3, :] - ray_origins.T
+    ray_dirs = ray_dirs_centered.T / torch.norm(ray_dirs_centered.T, dim=-1, keepdim=True)
+
+    if return_image_plane:
+        return ray_origins, ray_dirs, ray_dirs_unnormalized[:3, :]
 
     return ray_origins, ray_dirs

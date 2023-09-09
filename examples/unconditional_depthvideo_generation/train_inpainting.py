@@ -151,6 +151,7 @@ def parse_args():
     )
     parser.add_argument("--overwrite_output_dir", action="store_true")
     parser.add_argument("--bigger_model", action="store_true")
+    parser.add_argument("--visualize_dataloader", action="store_true")
     parser.add_argument("--use_harmonic", action="store_true")
     parser.add_argument(
         "--cache_dir",
@@ -559,7 +560,7 @@ def main(args):
         normalization_factor=args.normalization_factor,
         plucker_coords=args.train_with_plucker_coords,
         use_harmonic=args.use_harmonic,
-        visualize=False
+        visualize=args.visualize_dataloader
     )
 
     if args.train_with_plucker_coords:
@@ -619,7 +620,7 @@ def main(args):
         else:
             # Get the most recent checkpoint
             dirs = os.listdir(args.output_dir)
-            dirs = [d for d in dirs if d.startswith("checkpoint")]
+            dirs = [d for d in dirs if dtartswith("checkpoint")]
             dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
             path = dirs[-1] if len(dirs) > 0 else None
 
@@ -720,19 +721,27 @@ def main(args):
                     noise = noise[:, time_indices, ...]
                     clean_depths = clean_depths[:, time_indices, ...]
 
-                if args.prediction_type == "epsilon":
-                    loss = F.mse_loss(model_output, noise)  # this could have different weights!
-                elif args.prediction_type == "sample":
-                    alpha_t = _extract_into_tensor(
-                        noise_scheduler.alphas_cumprod, timesteps, (clean_depths.shape[0], 1, 1, 1)
-                    )
-                    snr_weights = alpha_t / (1 - alpha_t)
-                    loss = snr_weights * F.mse_loss(
-                        model_output, clean_depths, reduction="none"
-                    )  # use SNR weighting from distillation paper
-                    loss = loss.mean()
+                if args.loss_in_3d:
+                    assert args.prediction_type == "sample"
+                    model_output = model_output.reshape(B, len(time_indices), C, H, W)
+                    image_plane_in_3d = batch["image_plane_in_3d"].to(clean_depths.device)[:, time_indices, ...]
+                    prediction_in_3d = image_plane_in_3d * model_output
+                    groundtruth_in_3d = image_plane_in_3d * clean_depths
+                    loss = F.mse_loss(prediction_in_3d, groundtruth_in_3d)
                 else:
-                    raise ValueError(f"Unsupported prediction type: {args.prediction_type}")
+                    if args.prediction_type == "epsilon":
+                            loss = F.mse_loss(model_output, noise)  # this could have different weights!
+                    elif args.prediction_type == "sample":
+                        alpha_t = _extract_into_tensor(
+                            noise_scheduler.alphas_cumprod, timesteps, (clean_depths.shape[0], 1, 1, 1)
+                        )
+                        snr_weights = alpha_t / (1 - alpha_t)
+                        loss = snr_weights * F.mse_loss(
+                            model_output, clean_depths, reduction="none"
+                        )  # use SNR weighting from distillation paper
+                        loss = loss.mean()
+                    else:
+                        raise ValueError(f"Unsupported prediction type: {args.prediction_type}")
 
                 accelerator.backward(loss)
 
