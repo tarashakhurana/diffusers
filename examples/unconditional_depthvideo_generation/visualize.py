@@ -11,31 +11,9 @@ from diffusers import DDPMPipeline, DDPMDepthPoseInpaintingPipeline, DDPMInpaint
 from diffusers import DPMSolverMultistepScheduler, UNet2DModel, DDPMScheduler, DDPMConditioningScheduler
 import matplotlib.cm
 
+import utils
 from data import OccfusionDataset, collate_fn_depthpose, collate_fn_inpainting
 from utils import render_path_spiral, write_pointcloud
-
-
-def compute_scale_and_shift(prediction, target, mask):
-    # system matrix: A = [[a_00, a_01], [a_10, a_11]]
-    a_00 = torch.sum(mask * prediction * prediction, (1, 2, 3))
-    a_01 = torch.sum(mask * prediction, (1, 2, 3))
-    a_11 = torch.sum(mask, (1, 2, 3))
-    # right hand side: b = [b_0, b_1]
-    b_0 = torch.sum(mask * prediction * target, (1, 2, 3))
-    b_1 = torch.sum(mask * target, (1, 2, 3))
-    # solution: x = A^-1 . b = [[a_11, -a_01], [-a_10, a_00]] / (a_00 * a_11 - a_01 * a_10) . b
-    x_0 = torch.zeros_like(b_0)
-    x_1 = torch.zeros_like(b_1)
-    det = a_00 * a_11 - a_01 * a_01
-    valid = det.nonzero()
-    x_0[valid] = (a_11[valid] * b_0[valid] - a_01[valid] * b_1[valid]) / det[valid]
-    x_1[valid] = (-a_01[valid] * b_0[valid] + a_00[valid] * b_1[valid]) / det[valid]
-    return x_0, x_1
-
-
-def make_gif(frames, save_path, duration):
-    frame_one = frames[0]
-    frame_one.save(save_path, format="GIF", append_images=frames, save_all=True, duration=duration, loop=0)
 
 
 def parse_args():
@@ -429,12 +407,12 @@ def main(args):
                 write_pointcloud(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals/3d_{count}.ply", all_points, all_colors, edges=all_edges)
 
             os.makedirs(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals", exist_ok=True)
-            make_gif(colored_images, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals/2d_{count}.gif", duration=800)
+            utils.make_gif(colored_images, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals/2d_{count}.gif", duration=800)
 
             spiral.append(colored_images[6])
 
         if args.visualize_spiral:
-            make_gif(spiral, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals/spiral_{count}.gif", duration=800)
+            utils.make_gif(spiral, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals/spiral_{count}.gif", duration=800)
 
 
 if __name__ == "__main__":

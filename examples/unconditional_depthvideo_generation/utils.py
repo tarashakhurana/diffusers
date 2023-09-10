@@ -270,3 +270,39 @@ def get_plucker(K, Rt, H, W, return_image_plane=False, depth=None):
         return ray_origins, ray_dirs, cam_coords
 
     return ray_origins, ray_dirs
+
+
+def topk_l1_error(pd, gt):
+    l1_error = torch.mean(torch.abs(pd - gt), (1, 2, 3))
+    return min(l1_error)
+
+
+def topk_scaleshift_inv_l1_error(pd, gt):
+    scale, shift = compute_scale_and_shift(pd, gt, torch.ones_like(pd))
+    print(scale.shape, shift.shape, pd.shape)
+    pd_ssi = scale[:, None, None, None] * pd + shift[:, None, None, None]
+    return topk_l1_error(pd_ssi, gt)
+
+
+def compute_scale_and_shift(prediction, target, mask):
+    # system matrix: A = [[a_00, a_01], [a_10, a_11]]
+    a_00 = torch.sum(mask * prediction * prediction, (1, 2, 3))
+    a_01 = torch.sum(mask * prediction, (1, 2, 3))
+    a_11 = torch.sum(mask, (1, 2, 3))
+    # right hand side: b = [b_0, b_1]
+    b_0 = torch.sum(mask * prediction * target, (1, 2, 3))
+    b_1 = torch.sum(mask * target, (1, 2, 3))
+    # solution: x = A^-1 . b = [[a_11, -a_01], [-a_10, a_00]] / (a_00 * a_11 - a_01 * a_10) . b
+    x_0 = torch.zeros_like(b_0)
+    x_1 = torch.zeros_like(b_1)
+    det = a_00 * a_11 - a_01 * a_01
+    valid = det.nonzero()
+    x_0[valid] = (a_11[valid] * b_0[valid] - a_01[valid] * b_1[valid]) / det[valid]
+    x_1[valid] = (-a_01[valid] * b_0[valid] + a_00[valid] * b_1[valid]) / det[valid]
+    return x_0, x_1
+
+
+def make_gif(frames, save_path, duration):
+    frame_one = frames[0]
+    frame_one.save(save_path, format="GIF", append_images=frames, save_all=True, duration=duration, loop=0)
+
