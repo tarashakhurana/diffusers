@@ -6,7 +6,7 @@ import os
 import json
 from pathlib import Path
 from typing import Optional
-
+from matplotlib import pyplot as plt
 import accelerate
 import datasets
 import torch
@@ -33,6 +33,7 @@ from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, is_accelerate_version, is_tensorboard_available, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
+import utils
 from utils import HarmonicEmbedding, write_pointcloud
 from data import OccfusionDataset, collate_fn_depthpose, collate_fn_inpainting
 
@@ -188,6 +189,14 @@ def parse_args():
     )
     parser.add_argument(
         "--loss_in_3d",
+        default=False,
+        action="store_true",
+        help=(
+            "If you want the loss to be computed in 3D space. If not set, the loss will be computed in 2D space."
+        ),
+    )
+    parser.add_argument(
+        "--loss_in_2d",
         default=False,
         action="store_true",
         help=(
@@ -354,6 +363,7 @@ def parse_args():
         raise ValueError("You must specify either a dataset name from the hub or a train data directory.")
 
     assert args.n_input + args.n_output == args.num_images
+    assert args.loss_in_2d or args.loss_in_3d, "at least one loss should be specified"
 
     return args
 
@@ -717,32 +727,55 @@ def main(args):
                 model_output = model(model_inputs, timesteps).sample
 
                 if args.loss_only_on_masked:
-                    model_output = model_output[:, time_indices, ...]
-                    noise = noise[:, time_indices, ...]
-                    clean_depths = clean_depths[:, time_indices, ...]
+                    loss_indices = time_indices
+                else:
+                    loss_indices = [fn for fn in range(args.n_input + args.n_output)]
 
                 if args.loss_in_3d:
                     assert args.prediction_type == "sample"
-                    model_output = model_output.reshape(B, len(time_indices), C, H, W)
-                    image_plane_in_3d = batch["image_plane_in_3d"].to(clean_depths.device)[:, time_indices, ...]
-                    prediction_in_3d = image_plane_in_3d * model_output
-                    groundtruth_in_3d = image_plane_in_3d * clean_depths
-                    loss = F.mse_loss(prediction_in_3d, groundtruth_in_3d)
+                    model_output = model_output.reshape(B, T, H, W)
+                    model_output_01 = (model_output / 2 + 0.5).clip(0, 1)
+                    clean_depths_01 = (clean_depths / 2 + 0.5).clip(0, 1)
+                    image_plane_in_cam = batch["image_plane_in_cam"][:, loss_indices, ...].to(clean_depths.device)
+                    Rt = batch["Rt"][:, loss_indices, ...].to(clean_depths.device)
+                    prediction_in_3d = utils.get_points_given_imageplane(image_plane_in_cam, model_output_01[:, loss_indices, None, ...], Rt, 100.0)
+                    groundtruth_in_3d = utils.get_points_given_imageplane(image_plane_in_cam, clean_depths_01[:, loss_indices, None, ...], Rt, 100.0)
+                    loss_3d = F.mse_loss(prediction_in_3d, groundtruth_in_3d)
+
+                    """
+                    # visualize for debugging
+                    # shape of clean depths: B T 3 H W
+                    filenames = batch["filenames"]
+                    pcds = groundtruth_in_3d.permute(0, 1, 3, 4, 2).reshape(B, -1, 3)
+                    for p, pcd in enumerate(pcds):
+                        fn = str(filenames[p][0]).split("/")[6]
+                        write_pointcloud(f"/data/tkhurana/visualizations/loss_in_3d/{step}_{p}_{fn}.ply", pcd)
+                        for t in range(T):
+                            fn = str(filenames[p][t]).split("/")
+                            fn = fn[6] + "_" + fn[8][:-4]
+                            plt.imsave(f"/data/tkhurana/visualizations/loss_in_3d/depthmaps_{step}_{p}_{t}_{fn}.png", clean_depths_01[p,t].cpu().numpy())
+                    """
                 else:
+                    loss_3d = 0.0
+
+                if args.loss_in_2d:
                     if args.prediction_type == "epsilon":
-                            loss = F.mse_loss(model_output, noise)  # this could have different weights!
+                        loss_2d = F.mse_loss(model_output[:, loss_indices, ...], noise[:, loss_indices, ...])  # this could have different weights!
                     elif args.prediction_type == "sample":
                         alpha_t = _extract_into_tensor(
                             noise_scheduler.alphas_cumprod, timesteps, (clean_depths.shape[0], 1, 1, 1)
                         )
                         snr_weights = alpha_t / (1 - alpha_t)
-                        loss = snr_weights * F.mse_loss(
-                            model_output, clean_depths, reduction="none"
+                        loss_val = snr_weights * F.mse_loss(
+                                model_output[:, loss_indices, ...], clean_depths[:, loss_indices, ...], reduction="none"
                         )  # use SNR weighting from distillation paper
-                        loss = loss.mean()
+                        loss_2d = loss_val.mean()
                     else:
                         raise ValueError(f"Unsupported prediction type: {args.prediction_type}")
+                else:
+                    loss_2d = 0.0
 
+                loss = loss_2d + loss_3d
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:

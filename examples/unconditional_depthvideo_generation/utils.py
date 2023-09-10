@@ -232,13 +232,33 @@ def viewmatrix(z, up, pos):
     return m
 
 
-def get_plucker(K, Rt, H, W, return_image_plane=False):
+def get_points_given_imageplane(imageplane, depth, Rt, scale):
+    Rt_inv = torch.linalg.inv(Rt)
+    depth_in_cam = imageplane * depth * scale
+    depth_in_cam = torch.cat([depth_in_cam, torch.ones_like(depth_in_cam)[..., 0:1, :, :]], dim=-3)
+
+    if len(depth_in_cam.shape) == 3:
+        depth_in_cam = depth_in_cam[None, None, ...]
+    if len(depth_in_cam.shape) == 4:
+        depth_in_cam = depth_in_cam[None, ...]
+
+    if len(Rt_inv) == 2:
+        Rt_inv = Rt_inv[None, None, ...]
+
+    depth_in_world = torch.einsum("btnc,btchw->btnhw", Rt_inv, depth_in_cam)[..., :3, :, :]
+    return depth_in_world
+
+
+def get_plucker(K, Rt, H, W, return_image_plane=False, depth=None):
     Rt_inv = torch.linalg.inv(Rt)
     v, u = torch.meshgrid(torch.arange(H), torch.arange(W), indexing="ij")
     u = W - u - 1
-    uv_homo = torch.stack([u, v, torch.ones_like(v)]).float()
-    cam_coords = torch.linalg.inv(K) @ uv_homo.reshape(3, -1)
-    cam_coords_homo = torch.cat([torch.ones((1, cam_coords.shape[1])), cam_coords], dim=0)
+    uv_homo = torch.stack([u.flatten(), v.flatten(), torch.ones_like(v.flatten())]).float()
+    if depth is not None:
+        cam_coords = torch.linalg.inv(K) @ uv_homo * depth
+    else:
+        cam_coords = torch.linalg.inv(K) @ uv_homo
+    cam_coords_homo = torch.cat([cam_coords, torch.ones((1, cam_coords.shape[1]))], dim=0)
 
     ray_origins = repeat(Rt_inv[:3, 3], 'c -> c n', n=cam_coords_homo.shape[1]).T
 
@@ -247,6 +267,6 @@ def get_plucker(K, Rt, H, W, return_image_plane=False):
     ray_dirs = ray_dirs_centered.T / torch.norm(ray_dirs_centered.T, dim=-1, keepdim=True)
 
     if return_image_plane:
-        return ray_origins, ray_dirs, ray_dirs_unnormalized[:3, :]
+        return ray_origins, ray_dirs, cam_coords
 
     return ray_origins, ray_dirs
