@@ -1,19 +1,17 @@
 import os
 
-from matplotlib.cbook import time
+from numpy.ma import masked
+
 import torch
 import inspect
 import argparse
 import numpy as np
-from PIL import Image
-from torchvision import transforms
-from diffusers import DDPMPipeline, DDPMDepthPoseInpaintingPipeline, DDPMInpaintingPipeline, DDPMReconstructionPipeline
-from diffusers import DPMSolverMultistepScheduler, UNet2DModel, DDPMScheduler, DDPMConditioningScheduler
-import matplotlib.cm
+from prettytable import PrettyTable
+from diffusers import DDPMDepthPoseInpaintingPipeline, DDPMReconstructionPipeline
+from diffusers import UNet2DModel, DDPMScheduler
 
 import utils
 from data import OccfusionDataset, collate_fn_depthpose, collate_fn_inpainting
-from utils import render_path_spiral, write_pointcloud
 
 
 def parse_args():
@@ -200,6 +198,8 @@ def parse_args():
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
 
+    assert args.n_input + args.n_output == args.num_images, "n_input + n_output must equal num_images"
+
     if args.dataset_name is None and args.eval_data_dir is None:
         raise ValueError("You must specify either a dataset name from the hub or a train data directory.")
 
@@ -270,9 +270,7 @@ def main(args):
         kwargs["train_with_plucker_coords"] = args.train_with_plucker_coords
         pipeline = DDPMDepthPoseInpaintingPipeline(unet=unet, scheduler=noise_scheduler, kwargs=kwargs)
 
-    generator = torch.Generator(device=pipeline.device).manual_seed(0)
     # run pipeline in inference (sample random noise and denoise)
-
     top1_metric, top3_metric = 0, 0
     top1_inv_metric, top3_inv_metric = 0, 0
     count = 0
@@ -281,19 +279,18 @@ def main(args):
 
     for b, batch in enumerate(eval_dataloader):
 
-        data_point = batch["input"]
+        dp = batch["input"]
+        data_point = torch.stack([dp[0]] * 3)
+        B, T, H, W = data_point.shape
+        data_point_reshaped = data_point.reshape(B, args.num_images, -1, H, W)
         total_frames = data_point.shape[1]
         past_frames = torch.stack([data_point[0, :int(total_frames / 2), ...]] * 3)
-        future_frames = torch.stack([data_point[0, int(total_frames / 2):, ...]] * 3)
-        if args.train_with_plucker_coords:
-            ray_origin = batch["ray_origin"]
-            # ray_direction = batch["ray_direction"]
-            # cam_coords = batch["cam_coords"]
+        batch_size = 3
 
         if args.fair_comparison:
-            time_indices = [6]
-            args.num_masks = 1
-            batch_size = 1
+            assert args.masking_strategy == "random", "fair comparison only works with random masking"
+            time_indices = [1, 3, 5, 7, 9]
+            args.num_masks = 5
 
         if args.model_type == "reconstruction":
             prediction = pipeline(
@@ -311,9 +308,8 @@ def main(args):
                     output_type="numpy",
                     user_num_masks=args.num_masks,
                     user_time_indices=time_indices).images
-            masked_indices = np.array([i for i in range(args.n_input + args.n_output) if i not in unmasked_indices.tolist()])
+            masked_indices = [i for i in range(total_frames) if i not in unmasked_indices]
         elif args.model_type == "depthpose":
-            print("getting predictions using args.num_masks", args.num_masks)
             prediction, unmasked_indices = pipeline(
                     inpainting_image=data_point,
                     batch_size=batch_size,
@@ -322,25 +318,27 @@ def main(args):
                     user_num_masks=args.num_masks,
                     user_time_indices=time_indices,
                 ).images
-            masked_indices = np.array([i for i in range(args.n_input + args.n_output) if i not in unmasked_indices.tolist()])
+            masked_indices = [i for i in range(total_frames) if i not in unmasked_indices]
 
         prediction = torch.from_numpy(prediction).permute(0, 3, 1, 2)
         B, T, H, W = prediction.shape
         count += 1
 
+        groundtruth = data_point_reshaped[:, :, 0, ...]
+
         # shapes of prediction are batch x frames x height x width
         # shapes of groundtruth is the same
         # but now we need to find top 1 and top 3 numbers
         # we will compute both the normal and scale/shift invariant loss
-        top1_prediction = prediction[:1, ...]
-        top1_groundtruth = future_frames[:1, ...]
-        top1_metric += topk_l1_error(top1_prediction, top1_groundtruth)
-        top1_inv_metric += topk_scaleshift_inv_l1_error(top1_prediction, top1_groundtruth)
+        top1_prediction = prediction[:1, masked_indices, ...]
+        top1_groundtruth = groundtruth[:1, masked_indices, ...]
+        top1_metric += utils.topk_l1_error(top1_prediction, top1_groundtruth)
+        top1_inv_metric += utils.topk_scaleshift_inv_l1_error(top1_prediction, top1_groundtruth)
 
-        top3_prediction = prediction[:3, ...]
-        top3_groundtruth = future_frames[:3, ...]
-        top3_metric += topk_l1_error(top3_prediction, top3_groundtruth)
-        top3_inv_metric += topk_scaleshift_inv_l1_error(top3_prediction, top3_groundtruth)
+        top3_prediction = prediction[:3, masked_indices, ...]
+        top3_groundtruth = groundtruth[:3, masked_indices, ...]
+        top3_metric += utils.topk_l1_error(top3_prediction, top3_groundtruth)
+        top3_inv_metric += utils.topk_scaleshift_inv_l1_error(top3_prediction, top3_groundtruth)
 
         all_metrics = np.array([top1_metric, top1_inv_metric, top3_metric, top3_inv_metric])
         all_metrics /= count
