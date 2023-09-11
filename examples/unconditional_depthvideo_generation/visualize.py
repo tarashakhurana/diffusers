@@ -110,7 +110,7 @@ def parse_args():
     parser.add_argument(
         "--scale_factor",
         type=float,
-        default=10.0,
+        default=100.0,
         help=(
             "Factor to multiply the output by in order to get the predictions in a metric space"
         ),
@@ -210,6 +210,7 @@ def main(args):
     # Initialize the UNet2D
     Scheduler = DDPMScheduler  # DDPMConditioningScheduler
     unet = UNet2DModel.from_pretrained(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/unet")
+    unet = unet.to("cuda:0")
 
     dataset = OccfusionDataset(
         instance_data_root=args.eval_data_dir,
@@ -280,7 +281,7 @@ def main(args):
         # if b != 3:
         #     continue
 
-        data_point = batch["input"]
+        data_point = batch["input"].to("cuda:0")
         if args.train_with_plucker_coords:
             ray_origin = batch["ray_origin"]
             # ray_direction = batch["ray_direction"]

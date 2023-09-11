@@ -147,6 +147,14 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--fair_comparison",
+        default=False,
+        action="store_true",
+        help=(
+            "Whether to fix the number of masks and the masked indices for all experiments."
+        ),
+    )
+    parser.add_argument(
         "--random_flip",
         default=False,
         action="store_true",
@@ -210,6 +218,8 @@ def main(args):
     # Initialize the UNet2D
     Scheduler = DDPMScheduler  # DDPMConditioningScheduler
     unet = UNet2DModel.from_pretrained(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/unet")
+    unet = unet.to("cuda:0")
+
 
     dataset = OccfusionDataset(
         instance_data_root=args.eval_data_dir,
@@ -277,12 +287,11 @@ def main(args):
 
     headers = ['Top1', 'Top1 (inv)', 'Top3', 'Top3 (inv)']
 
-    for b, batch in enumerate(eval_dataloader):
+    for b, batch in enumerate(tqdm(eval_dataloader)):
 
         dp = batch["input"]
-        data_point = torch.stack([dp[0]] * 3)
-        B, T, H, W = data_point.shape
-        data_point_reshaped = data_point.reshape(B, args.num_images, -1, H, W)
+        data_point = torch.stack([dp[0]] * 3).to("cuda:0")
+        B, T, C, H, W = data_point.shape
         total_frames = data_point.shape[1]
         past_frames = torch.stack([data_point[0, :int(total_frames / 2), ...]] * 3)
         batch_size = 3
@@ -324,7 +333,7 @@ def main(args):
         B, T, H, W = prediction.shape
         count += 1
 
-        groundtruth = data_point_reshaped[:, :, 0, ...]
+        groundtruth = data_point[:, :, 0, ...].cpu()
 
         # shapes of prediction are batch x frames x height x width
         # shapes of groundtruth is the same

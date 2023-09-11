@@ -16,6 +16,7 @@
 from typing import List, Optional, Tuple, Union
 
 import torch
+from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 
 from ...utils import randn_tensor
@@ -37,6 +38,7 @@ class DDPMDepthPoseInpaintingPipeline(DiffusionPipeline):
     def __init__(self, unet, scheduler, kwargs):
         super().__init__()
         self.register_modules(unet=unet, scheduler=scheduler)
+        self.register_to_config(kwargs=kwargs)
         self.n_input = kwargs["n_input"]
         self.n_output = kwargs["n_output"]
         self.masking_strategy = kwargs["masking_strategy"]
@@ -100,8 +102,6 @@ class DDPMDepthPoseInpaintingPipeline(DiffusionPipeline):
         # set step values
         self.scheduler.set_timesteps(num_inference_steps)
 
-        print("inpainting image shape", inpainting_image.shape)
-
         for t in self.progress_bar(self.scheduler.timesteps):
             # 0. prepare the model inputs
             # if plucker coords == True then the inpainting image is a 5D tensor
@@ -117,7 +117,6 @@ class DDPMDepthPoseInpaintingPipeline(DiffusionPipeline):
             clean_depths = clean_images[:, :, 0, :, :]
 
             if self.train_with_plucker_coords:
-                print(image.shape, clean_images.shape)
                 noisy_images = torch.cat([image[:, :, None, :, :], clean_images[:, :, 1:, :, :]], dim=2)
             else:
                 noisy_images = image
@@ -162,6 +161,12 @@ class DDPMDepthPoseInpaintingPipeline(DiffusionPipeline):
                     noisy_images.reshape(B, T*C, H, W),
                     clean_images_masked.reshape(B, T*C, H, W),
                     mask_images.reshape(B, T, H, W)], dim=1)
+
+            writer = SummaryWriter("/data/tkhurana/visualizations/graph_test")
+            writer.add_graph(self.unet, [model_inputs, t], use_strict_trace=False)
+            writer.close()
+
+            exit()
 
             # 1. predict noise model_output
             model_output = self.unet(model_inputs, t).sample
