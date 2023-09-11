@@ -475,6 +475,7 @@ class OccfusionDataset(Dataset):
                 all_rt.append(Rt)
                 all_k.append(K)
 
+                """
                 if self.visualize:
                     # depth_to_visualize = transforms.CenterCrop(self.size)(depth_to_visualize)
                     depth_to_visualize = (depth_preprocessed / 2 + 0.5).clamp(0, 1)
@@ -485,6 +486,7 @@ class OccfusionDataset(Dataset):
                     all_edges.append(edges.astype(int))
                     all_colors.append(np.zeros_like(all_points[-1]) + 19 * (i+1))
                     offset += all_points[-1].shape[0]
+                """
 
             else:
                 depth_frames.append(depth_preprocessed)
@@ -511,13 +513,15 @@ class OccfusionDataset(Dataset):
                 if self.visualize:
                     fig = plt.figure()
                     ax = fig.add_subplot(projection='3d')
-                    utils.draw_wireframe_camera(ax, mp, scale=1.0, color='r')
+                    utils.draw_wireframe_camera(ax, mp.numpy(), scale=1.0, color='r')
                     for p in range(12):
                         vis_c2w = render_poses[p][:4, :4]
                         utils.draw_wireframe_camera(ax, vis_c2w, scale=1.0, color='g')
+                    """
                     for p in range(12):
                         vis_c2w = torch.linalg.inv(all_rt[p])
-                        utils.draw_wireframe_camera(ax, vis_c2w, scale=1.0, color='b')
+                        utils.draw_wireframe_camera(ax, vis_c2w.numpy(), scale=1.0, color='b')
+                    """
                     plt.savefig("/data/tkhurana/visualizations/plucker/pose_spiral.png")
 
                 render_poses = torch.from_numpy(render_poses[:, :3, :4])
@@ -530,11 +534,13 @@ class OccfusionDataset(Dataset):
                     render_plucker_map = transforms.CenterCrop(self.size)(render_plucker_rays.reshape(H, W, -1).permute(2, 0, 1))
                     depth_video[p, 6, 1:, ...] = render_plucker_map
 
+        """
         if self.visualize:
             all_points = np.concatenate(all_points, axis=0)
             all_edges = np.concatenate(all_edges, axis=0)
             all_colors = np.concatenate(all_colors, axis=0)
             utils.write_pointcloud(f"/data/tkhurana/visualizations/plucker/{ref_index}.ply", all_points, rgb_points=all_colors)
+        """
 
         example["input"] = depth_video  # video is of shape T x H x W or T x C x H x W
         example["filenames"] = all_filenames

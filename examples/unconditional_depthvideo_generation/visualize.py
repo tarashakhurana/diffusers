@@ -221,7 +221,7 @@ def main(args):
         normalization_factor=args.normalization_factor,
         plucker_coords=args.train_with_plucker_coords,
         use_harmonic=False,
-        visualize=False,
+        visualize=True,
         spiral_poses=args.visualize_spiral,
     )
 

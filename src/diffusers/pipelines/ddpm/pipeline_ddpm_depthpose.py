@@ -16,7 +16,6 @@
 from typing import List, Optional, Tuple, Union
 
 import torch
-from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 
 from ...utils import randn_tensor
@@ -161,12 +160,6 @@ class DDPMDepthPoseInpaintingPipeline(DiffusionPipeline):
                     noisy_images.reshape(B, T*C, H, W),
                     clean_images_masked.reshape(B, T*C, H, W),
                     mask_images.reshape(B, T, H, W)], dim=1)
-
-            writer = SummaryWriter("/data/tkhurana/visualizations/graph_test")
-            writer.add_graph(self.unet, [model_inputs, t], use_strict_trace=False)
-            writer.close()
-
-            exit()
 
             # 1. predict noise model_output
             model_output = self.unet(model_inputs, t).sample
