@@ -306,3 +306,48 @@ def make_gif(frames, save_path, duration):
     frame_one = frames[0]
     frame_one.save(save_path, format="GIF", append_images=frames, save_all=True, duration=duration, loop=0)
 
+
+def draw_wireframe_camera(ax, world_T_camera=None, scale=1.0, color="b"):
+    """
+    Draw a wireframe camera in 3D matplotlib plot.
+    Args:
+        ax: matplotlib 3D axis
+        world_T_camera: 4x4 transformation matrix from camera to world frame
+    """
+    # Camera body vertices
+    vertices = np.array(
+        [
+            [-1, -1, 1.0],  # Front top-left
+            [1, -1, 1.0],  # Front top-right
+            [-1, 1, 1.0],  # Front bottom-left
+            [1, 1, 1.0],  # Front bottom-right
+            [0.0, 0.0, 0.0],  # Back (lens) center
+        ]
+    )
+    vertices = vertices * scale
+
+    # Apply the transformation matrix if provided
+    if world_T_camera is not None:
+        world_R_camera = world_T_camera[:3, :3]
+        world_t_camera = world_T_camera[:3, 3]
+        vertices = (world_R_camera @ vertices.T + world_t_camera[:, None]).T
+
+    # Define edges by connecting vertices
+    edges = [
+        [vertices[0], vertices[1], vertices[3], vertices[2], vertices[0]],
+        [vertices[0], vertices[2]],
+        [vertices[1], vertices[3]],
+        [vertices[0], vertices[4]],
+        [vertices[1], vertices[4]],
+        [vertices[2], vertices[4]],
+        [vertices[3], vertices[4]],
+    ]
+
+    # Convert vertices and edges to numpy arrays
+    vertices = np.array(vertices)
+    edges = [np.array(edge) for edge in edges]
+
+    # Plot the camera wireframe
+    for edge in edges:
+        ax.plot3D(*edge.T, color=color)
+

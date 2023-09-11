@@ -25,6 +25,7 @@ from packaging import version
 from torchvision import transforms
 from tqdm.auto import tqdm
 from pathlib import Path
+from matplotlib import pyplot as plt
 
 import utils
 
@@ -422,7 +423,6 @@ class OccfusionDataset(Dataset):
             assert ref_seq == curr_seq
 
             depth = cv2.imread(str(self.filenames[ref_index - i]), cv2.IMREAD_ANYDEPTH)
-            # print("min and max values in depth", np.array(depth).min(), np.array(depth).max(), np.array(depth).dtdepth = np.array(depth).astype(np.float32) / self.normalization_factor
 
             depth = depth.astype(np.float32) / self.normalization_factor
 
@@ -505,6 +505,21 @@ class OccfusionDataset(Dataset):
                 middle_pose[0, :3, :4] = mp[:3, :4]
                 middle_pose[0, :, 4] = np.array([H, W, middle_K[0,0]])
                 render_poses = np.stack(utils.render_path_spiral(middle_pose, 3.0, N = 12))
+
+                # render poses should be of shape 12 x 3 x 5
+                # visualize them if the user wants to
+                if self.visualize:
+                    fig = plt.figure()
+                    ax = fig.add_subplot(projection='3d')
+                    utils.draw_wireframe_camera(ax, mp, scale=1.0, color='r')
+                    for p in range(12):
+                        vis_c2w = render_poses[p][:4, :4]
+                        utils.draw_wireframe_camera(ax, vis_c2w, scale=1.0, color='g')
+                    for p in range(12):
+                        vis_c2w = torch.linalg.inv(all_rt[p])
+                        utils.draw_wireframe_camera(ax, vis_c2w, scale=1.0, color='b')
+                    plt.savefig("/data/tkhurana/visualizations/plucker/pose_spiral.png")
+
                 render_poses = torch.from_numpy(render_poses[:, :3, :4])
                 depth_video = depth_video.unsqueeze(0).repeat(12, 1, 1, 1, 1)
                 for p in range(12):
