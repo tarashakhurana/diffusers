@@ -513,16 +513,14 @@ class OccfusionDataset(Dataset):
                 if self.visualize:
                     fig = plt.figure()
                     ax = fig.add_subplot(projection='3d')
-                    utils.draw_wireframe_camera(ax, mp.numpy(), scale=1.0, color='r')
                     for p in range(12):
                         vis_c2w = render_poses[p][:4, :4]
                         utils.draw_wireframe_camera(ax, vis_c2w, scale=1.0, color='g')
-                    """
                     for p in range(12):
                         vis_c2w = torch.linalg.inv(all_rt[p])
                         utils.draw_wireframe_camera(ax, vis_c2w.numpy(), scale=1.0, color='b')
-                    """
-                    plt.savefig("/data/tkhurana/visualizations/plucker/pose_spiral.png")
+                    utils.draw_wireframe_camera(ax, mp.numpy(), scale=1.0, color='r')
+                    plt.show()
 
                 render_poses = torch.from_numpy(render_poses[:, :3, :4])
                 depth_video = depth_video.unsqueeze(0).repeat(12, 1, 1, 1, 1)
