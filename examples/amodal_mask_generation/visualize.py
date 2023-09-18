@@ -12,7 +12,7 @@ from diffusers import DPMSolverMultistepScheduler, UNet2DModel, DDPMScheduler, D
 import matplotlib.cm
 
 import utils
-from data import OccfusionDataset, collate_fn_depthpose, collate_fn_inpainting
+from data import TAOMasksDataset, collate_fn_inpainting
 from utils import render_path_spiral, write_pointcloud
 
 
@@ -31,7 +31,7 @@ def parse_args():
     parser.add_argument(
         "--model_dir",
         type=str,
-        default="/data3/tkhurana/diffusers/logs/PointOdyssey-depth_train_6s_randomhalf_masking_resolution64_with_plucker/",
+        default="/data3/tkhurana/diffusers/logs/TAO-Masks_input2output2_offset1/",
         help=(
             "Path to saved checkpoints"
         ),
@@ -39,7 +39,7 @@ def parse_args():
     parser.add_argument(
         "--eval_data_dir",
         type=str,
-        default="/data/tkhurana/datasets/pointodyssey/val/",
+        default="/compute/trinity-1-38/chengyeh/TAO/BURST_annotations/train/train_visibility.json",
         help=(
             "Path to the eval data directory"
         ),
@@ -53,41 +53,41 @@ def parse_args():
     parser.add_argument(
         "--n_input",
         type=int,
-        default=6,
+        default=2,
     )
     parser.add_argument(
         "--n_output",
         type=int,
-        default=6,
+        default=2,
     )
     parser.add_argument(
         "--out_channels",
         type=int,
-        default=12,
+        default=4,
         help="Output channels in the UNet.",
     )
     parser.add_argument(
         "--checkpoint_number",
         type=int,
-        default=1000,
+        default=10000,
         help="The iteration number of the checkpoint to load from the model_dir.",
     )
     parser.add_argument(
         "--in_channels",
         type=int,
-        default=180,
+        default=12,
         help="Input channels in the UNet.",
     )
     parser.add_argument(
         "--num_images",
         type=int,
-        default=12,
+        default=4,
         help="Number of frames in the depth video.",
     )
     parser.add_argument(
         "--offset",
         type=int,
-        default=15,
+        default=1,
         help="Number of frames in the original video after which a frame should be picked.",
     )
     parser.add_argument(
@@ -181,19 +181,20 @@ def parse_args():
     parser.add_argument(
         "--masking_strategy",
         type=str,
-        default="random",
+        default="half",
         choices=["all", "none", "random", "random-half", "random"],
     )
     parser.add_argument(
         "--model_type",
         type=str,
-        default="depthpose",
+        default="inpainting",
         choices=["reconstruction", "inpainting", "depthpose"],
         help="Whether the model should predict the 'epsilon'/noise error or directly the reconstructed image 'x0'.",
     )
     parser.add_argument("--ddpm_num_steps", type=int, default=1000)
     parser.add_argument("--ddpm_num_inference_steps", type=int, default=1000)
     parser.add_argument("--num_inference_steps", type=int, default=40)
+    parser.add_argument("--visualize_dataloader", action="store_true")
     parser.add_argument("--ddpm_beta_schedule", type=str, default="linear")
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -212,25 +213,18 @@ def main(args):
     unet = UNet2DModel.from_pretrained(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/unet")
     unet = unet.to("cuda:0")
 
-    dataset = OccfusionDataset(
-        instance_data_root=args.eval_data_dir,
+    dataset = TAOMasksDataset(
+        mask_annotation_root=args.eval_data_dir,
         size=args.resolution,
         center_crop=args.center_crop,
         num_images=args.num_images,
         offset=args.offset,
-        normalization_factor=args.normalization_factor,
-        plucker_coords=args.train_with_plucker_coords,
-        use_harmonic=False,
-        visualize=True,
-        spiral_poses=args.visualize_spiral,
+        visualize_batch=args.visualize_dataloader
     )
 
     assert args.eval_batch_size == 1, "eval batch size must be 1"
 
-    if args.model_type == "inpainting" or args.model_type == "reconstruction":
-        collate_fn = collate_fn_inpainting
-    elif args.model_type == "depthpose":
-        collate_fn = collate_fn_depthpose
+    collate_fn = collate_fn_inpainting
 
     eval_dataloader = torch.utils.data.DataLoader(
         dataset,
@@ -301,8 +295,8 @@ def main(args):
             data_point = data_point[0]
             print(data_point[0, 6, 1, 0, :], data_point[1, 6, 1, 0, :])
         else:
-            time_indices = [6]
-            args.num_masks = 1
+            time_indices = None
+            args.num_masks = None
             batch_size = 1
 
         if args.model_type == "reconstruction":
@@ -410,9 +404,8 @@ def main(args):
             os.makedirs(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals", exist_ok=True)
             utils.make_gif(colored_images, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals/2d_{count}.gif", duration=800)
 
-            spiral.append(colored_images[6])
-
         if args.visualize_spiral:
+            spiral.append(colored_images[6])
             utils.make_gif(spiral, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals/spiral_{count}.gif", duration=800)
 
 

@@ -349,7 +349,7 @@ class OccfusionDataset(Dataset):
                     if np.sum(intrinsics[0].astype(int)) == 1: #  or int(intrinsics[0][2][2]) != 1 or int(intrinsics[0][0][0]) == 0 or int(intrinsics[0][1][1]) == 0:
                         continue
 
-                assert len(frames) == extrinsics.shape[0] == intrinsics.shape[0]
+                    assert len(frames) == extrinsics.shape[0] == intrinsics.shape[0]
 
                 for idx in range(0, len(frames), self.offset):
                     frame_path = frames[idx]
@@ -400,7 +400,8 @@ class OccfusionDataset(Dataset):
         example = {}
         ref_index = self.valid_indices[index]
         ref_seq = self.sequences[ref_index]
-        ref_from_global = self.extrinsics[ref_index]
+        if self.plucker_coords:
+            ref_from_global = self.extrinsics[ref_index]
         depth_frames = []
         all_filenames = []
         all_ray_origin = []

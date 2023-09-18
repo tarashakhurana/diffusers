@@ -49,7 +49,7 @@ class TAOMasksDataset(Dataset):
 
         burstdataset = BURSTDataset(str(self.mask_annotation_root))
 
-        category_id_to_name = burstdataset.category_names
+        self.category_id_to_name = burstdataset.category_names
 
         for video in burstdataset:
             start_index = len(self.filenames)
@@ -69,13 +69,13 @@ class TAOMasksDataset(Dataset):
                             "rle": segmentations[t][track_id]["rle"],
                             "image_size": image_size,
                             "vis": segmentations[t][track_id]["visibility"],
-                            "category": category_id_to_name[video._track_category_ids[track_id]]})
+                            "category": video._track_category_ids[track_id]})
                     else:
                         tracks[track_id].append({
                             "rle": "",
                             "image_size": image_size,
                             "vis": 0.0,
-                            "category": category_id_to_name[video._track_category_ids[track_id]]})
+                            "category": video._track_category_ids[track_id]})
 
             all_tracks[video_name] = tracks
 
@@ -124,8 +124,7 @@ class TAOMasksDataset(Dataset):
 
         self.image_transforms = transforms.Compose(
             [
-                transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
-                transforms.CenterCrop(size),
+                transforms.Resize((size, size), interpolation=transforms.InterpolationMode.BILINEAR),
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5]),
             ]
@@ -137,12 +136,13 @@ class TAOMasksDataset(Dataset):
     def __getitem__(self, index):
         example = {}
         ref_index = self.valid_indices[index]
+        ref_frame = self.all_subsequences[ref_index]
 
         masks = []
         visualized = False
 
         for i in range(self.num_images):
-            frame = self.all_subsequences[ref_index + i - self.num_images]
+            frame = self.all_subsequences[ref_index + i - self.num_images + 1]
             full_mask = rle_ann_to_mask(frame["rle"], frame["image_size"]) * 255
             full_mask = full_mask.astype("uint8")
             per_object_mask = np.where(full_mask == 255)
@@ -176,6 +176,7 @@ class TAOMasksDataset(Dataset):
         mask_video = torch.stack(masks, axis=0)
 
         example["input"] = mask_video
+        example["class_label"] = ref_frame["category"]
         return example
 
 

@@ -136,7 +136,7 @@ def parse_args():
     parser.add_argument(
         "--train_data_dir",
         type=str,
-        default="/home/tkhurana/Desktop/CMU/Thesis/Everything4D/BURST-benchmark/train_visibility.json",
+        default="/compute/trinity-1-38/chengyeh/TAO/BURST_annotations/train/train_visibility.json",
         help=(
             "A folder containing the training data. Folder contents must follow the structure described in"
             " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
@@ -146,7 +146,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/home/tkhurana/diffusers-logs/TAO-Masks_input2output2_offset1",
+        default="/data3/tkhurana/diffusers/logs/TAO-Masks_input2output2_offset1_nocrop",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument("--overwrite_output_dir", action="store_true")
@@ -391,7 +391,7 @@ def main(args):
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.logger,
-        project_dir=logging_dir,
+        logging_dir=logging_dir,
         project_config=accelerator_project_config,
     )
 
