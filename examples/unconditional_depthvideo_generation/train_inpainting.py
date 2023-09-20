@@ -224,7 +224,7 @@ def parse_args():
             " process."
         ),
     )
-    parser.add_argument("--num_epochs", type=int, default=600)
+    parser.add_argument("--num_epochs", type=int, default=1500)
     parser.add_argument("--save_images_epochs", type=int, default=10000000000000000, help="How often to save images during training.")
     parser.add_argument(
         "--save_model_epochs", type=int, default=10, help="How often to save the model during training."
@@ -352,6 +352,9 @@ def parse_args():
     )
     parser.add_argument(
         "--train_with_plucker_coords", action="store_true", help="Whether or not to append plucker coord maps to every depth map"
+    )
+    parser.add_argument(
+        "--use_rendering", action="store_true", help="Whether or not to append plucker coord maps to every depth map"
     )
 
     args = parser.parse_args()
@@ -574,7 +577,10 @@ def main(args):
     )
 
     if args.train_with_plucker_coords:
-        collate_fn = collate_fn_depthpose
+        if args.use_rendering:
+            collate_fn = collate_fn_inpainting
+        else:
+            collate_fn = collate_fn_depthpose
     else:
         collate_fn = collate_fn_inpainting
 
@@ -665,6 +671,11 @@ def main(args):
             if not args.train_with_plucker_coords:
                 clean_images = clean_images[:, :, None, :, :]
 
+            if args.use_rendering:
+                assert args.train_with_plucker_coords
+                rendering_poses = clean_images[:, :, 1:, :, :]
+                clean_images = clean_images[:, :, :1, :, :]
+
             B, T, C, H, W = clean_images.shape
             clean_depths = clean_images[:, :, 0, :, :]
             noise = torch.randn(clean_depths.shape).to(clean_depths.device)
@@ -679,7 +690,10 @@ def main(args):
             noisy_depths = noise_scheduler.add_noise(clean_depths, noise, timesteps)
 
             if args.train_with_plucker_coords:
-                noisy_images = torch.cat([noisy_depths[:, :, None, :, :], clean_images[:, :, 1:, :, :]], dim=2)
+                if args.use_rendering:
+                    noisy_images = noisy_depths[:, :, None, :, :]
+                else:
+                    noisy_images = torch.cat([noisy_depths[:, :, None, :, :], clean_images[:, :, 1:, :, :]], dim=2)
             else:
                 noisy_images = noisy_depths[:, :, None, :, :]
 
@@ -712,7 +726,10 @@ def main(args):
                 mask_images[:, time_indices, ...] = torch.ones_like(clean_images[:, time_indices, 0, ...])
                 clean_depths_masked = clean_depths * (1 - mask_images)
                 if args.train_with_plucker_coords:
-                    clean_images_masked = torch.cat([clean_depths_masked[:, :, None, :, :], clean_images[:, :, 1:, :, :]], dim=2)
+                    if args.use_rendering:
+                        clean_images_masked = clean_depths_masked
+                    else:
+                        clean_images_masked = torch.cat([clean_depths_masked[:, :, None, :, :], clean_images[:, :, 1:, :, :]], dim=2)
                 else:
                     clean_images_masked = clean_depths_masked
                 model_inputs = torch.cat([
@@ -725,6 +742,13 @@ def main(args):
                 # Predict the noise residual
                 # timesteps_unet = torch.zeros((bsz,), device=clean_images.device).long()
                 model_output = model(model_inputs, timesteps).sample
+
+                if args.use_rendering:
+                    # model output should be devoid of the time dimension
+                    assert args.train_with_plucker_coords
+                    assert args.prediction_type == "sample"
+                    model_output = model_output.reshape(B, T, 6, H, W)
+                    model_output = torch.einsum("btnhw,btnhw->bthw", rendering_poses, model_output)
 
                 if args.loss_only_on_masked:
                     loss_indices = time_indices

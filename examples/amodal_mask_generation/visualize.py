@@ -31,7 +31,7 @@ def parse_args():
     parser.add_argument(
         "--model_dir",
         type=str,
-        default="/data3/tkhurana/diffusers/logs/TAO-Masks_input2output2_offset1/",
+        default="/data3/tkhurana/diffusers/logs/TAO-Masks_input2output2_offset1_nocrop/",
         help=(
             "Path to saved checkpoints"
         ),
@@ -39,7 +39,7 @@ def parse_args():
     parser.add_argument(
         "--eval_data_dir",
         type=str,
-        default="/compute/trinity-1-38/chengyeh/TAO/BURST_annotations/train/train_visibility.json",
+        default="/compute/trinity-1-38/chengyeh/TAO/BURST_annotations/val/all_classes_visibility.json",
         help=(
             "Path to the eval data directory"
         ),
@@ -69,7 +69,7 @@ def parse_args():
     parser.add_argument(
         "--checkpoint_number",
         type=int,
-        default=10000,
+        default=12500,
         help="The iteration number of the checkpoint to load from the model_dir.",
     )
     parser.add_argument(
@@ -142,6 +142,14 @@ def parse_args():
     )
     parser.add_argument(
         "--train_with_plucker_coords",
+        default=False,
+        action="store_true",
+        help=(
+            "Whether to train with Plucker coordinates or not."
+        ),
+    )
+    parser.add_argument(
+        "--use_rendering",
         default=False,
         action="store_true",
         help=(
@@ -255,6 +263,7 @@ def main(args):
         kwargs["n_output"] = args.n_output
         kwargs["masking_strategy"] = args.masking_strategy
         kwargs["train_with_plucker_coords"] = args.train_with_plucker_coords
+        kwargs["use_rendering"] = args.use_rendering
         pipeline = DDPMDepthPoseInpaintingPipeline(unet=unet, scheduler=noise_scheduler, kwargs=kwargs)
         # pipeline = DDPMInpaintingPipeline(unet=unet, scheduler=noise_scheduler)
     elif args.model_type == "depthpose":
@@ -263,6 +272,7 @@ def main(args):
         kwargs["n_output"] = args.n_output
         kwargs["masking_strategy"] = args.masking_strategy
         kwargs["train_with_plucker_coords"] = args.train_with_plucker_coords
+        kwargs["use_rendering"] = args.use_rendering
         pipeline = DDPMDepthPoseInpaintingPipeline(unet=unet, scheduler=noise_scheduler, kwargs=kwargs)
 
     generator = torch.Generator(device=pipeline.device).manual_seed(0)

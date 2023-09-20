@@ -149,6 +149,14 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--use_rendering",
+        default=False,
+        action="store_true",
+        help=(
+            "Whether to use rendering at the end of the network"
+        ),
+    )
+    parser.add_argument(
         "--random_flip",
         default=False,
         action="store_true",
@@ -182,7 +190,7 @@ def parse_args():
         "--masking_strategy",
         type=str,
         default="random",
-        choices=["all", "none", "random", "random-half", "random"],
+        choices=["all", "none", "random", "random-half", "half"],
     )
     parser.add_argument(
         "--model_type",
@@ -252,6 +260,10 @@ def main(args):
     else:
         noise_scheduler = Scheduler(num_train_timesteps=1000, beta_schedule="linear")
 
+    if args.use_rendering:
+        assert args.train_with_plucker_coords
+        assert args.prediction_type == "sample"
+
     # noise_scheduler = DPMSolverMultistepScheduler(num_train_timesteps=1000, beta_schedule="linear")
     if args.model_type == "reconstruction":
         pipeline = DDPMReconstructionPipeline(unet=unet, scheduler=noise_scheduler)
@@ -261,6 +273,7 @@ def main(args):
         kwargs["n_output"] = args.n_output
         kwargs["masking_strategy"] = args.masking_strategy
         kwargs["train_with_plucker_coords"] = args.train_with_plucker_coords
+        kwargs["use_rendering"] = args.use_rendering
         pipeline = DDPMDepthPoseInpaintingPipeline(unet=unet, scheduler=noise_scheduler, kwargs=kwargs)
         # pipeline = DDPMInpaintingPipeline(unet=unet, scheduler=noise_scheduler)
     elif args.model_type == "depthpose":
@@ -269,6 +282,7 @@ def main(args):
         kwargs["n_output"] = args.n_output
         kwargs["masking_strategy"] = args.masking_strategy
         kwargs["train_with_plucker_coords"] = args.train_with_plucker_coords
+        kwargs["use_rendering"] = args.use_rendering
         pipeline = DDPMDepthPoseInpaintingPipeline(unet=unet, scheduler=noise_scheduler, kwargs=kwargs)
 
     generator = torch.Generator(device=pipeline.device).manual_seed(0)
@@ -301,8 +315,8 @@ def main(args):
             data_point = data_point[0]
             print(data_point[0, 6, 1, 0, :], data_point[1, 6, 1, 0, :])
         else:
-            time_indices = [6]
-            args.num_masks = 1
+            time_indices = None # [0,1,2,3,4,5,7,8,9,10,11]
+            args.num_masks = None # 11
             batch_size = 1
 
         if args.model_type == "reconstruction":
@@ -410,9 +424,8 @@ def main(args):
             os.makedirs(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals", exist_ok=True)
             utils.make_gif(colored_images, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals/2d_{count}.gif", duration=800)
 
-            spiral.append(colored_images[6])
-
         if args.visualize_spiral:
+            spiral.append(colored_images[6])
             utils.make_gif(spiral, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals/spiral_{count}.gif", duration=800)
 
 

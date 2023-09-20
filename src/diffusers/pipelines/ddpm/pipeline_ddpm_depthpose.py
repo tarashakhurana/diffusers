@@ -42,6 +42,7 @@ class DDPMDepthPoseInpaintingPipeline(DiffusionPipeline):
         self.n_output = kwargs["n_output"]
         self.masking_strategy = kwargs["masking_strategy"]
         self.train_with_plucker_coords = kwargs["train_with_plucker_coords"]
+        self.use_rendering = kwargs["use_rendering"]
 
     @torch.no_grad()
     def __call__(
@@ -82,14 +83,26 @@ class DDPMDepthPoseInpaintingPipeline(DiffusionPipeline):
         # Sample gaussian noise to begin loop
         # note the change to out channels
         if isinstance(self.unet.config.sample_size, int):
-            image_shape = (
-                batch_size,
-                self.unet.config.out_channels,
-                self.unet.config.sample_size,
-                self.unet.config.sample_size,
-            )
+            if not self.use_rendering:
+                image_shape = (
+                    batch_size,
+                    self.unet.config.out_channels,
+                    self.unet.config.sample_size,
+                    self.unet.config.sample_size,
+                )
+            else:
+                image_shape = (
+                    batch_size,
+                    12,
+                    self.unet.config.sample_size,
+                    self.unet.config.sample_size,
+                )
+
         else:
-            image_shape = (batch_size, self.unet.config.out_channels, *self.unet.config.sample_size)
+            if self.use_rendering:
+                image_shape = (batch_size, self.unet.config.out_channels, *self.unet.config.sample_size)
+            else:
+                image_shape = (batch_size, 12, *self.unet.config.sample_size)
 
         if self.device.type == "mps":
             # randn does not work reproducibly on mps
@@ -112,11 +125,19 @@ class DDPMDepthPoseInpaintingPipeline(DiffusionPipeline):
             if not self.train_with_plucker_coords:
                 clean_images = clean_images[:, :, None, :, :]
 
+            if self.use_rendering:
+                assert self.train_with_plucker_coords
+                rendering_poses = clean_images[:, :, 1:, :, :]
+                clean_images = clean_images[:, :, :1, :, :]
+
             B, T, C, H, W = clean_images.shape
             clean_depths = clean_images[:, :, 0, :, :]
 
             if self.train_with_plucker_coords:
-                noisy_images = torch.cat([image[:, :, None, :, :], clean_images[:, :, 1:, :, :]], dim=2)
+                if self.use_rendering:
+                    noisy_images = image
+                else:
+                    noisy_images = torch.cat([image[:, :, None, :, :], clean_images[:, :, 1:, :, :]], dim=2)
             else:
                 noisy_images = image
 
@@ -153,16 +174,23 @@ class DDPMDepthPoseInpaintingPipeline(DiffusionPipeline):
                 mask_images[:, time_indices, ...] = torch.ones_like(clean_images[:, time_indices, 0, ...])
                 clean_depths_masked = clean_depths * (1 - mask_images)
                 if self.train_with_plucker_coords:
-                    clean_images_masked = torch.cat([clean_depths_masked[:, :, None, :, :], clean_images[:, :, 1:, :, :]], dim=2)
+                    if self.use_rendering:
+                        clean_images_masked = clean_depths_masked
+                    else:
+                        clean_images_masked = torch.cat([clean_depths_masked[:, :, None, :, :], clean_images[:, :, 1:, :, :]], dim=2)
                 else:
                     clean_images_masked = clean_depths_masked
                 model_inputs = torch.cat([
-                    noisy_images.reshape(B, T*C, H, W),
-                    clean_images_masked.reshape(B, T*C, H, W),
+                    noisy_images.reshape(B, -1, H, W),
+                    clean_images_masked.reshape(B, -1, H, W),
                     mask_images.reshape(B, T, H, W)], dim=1)
 
             # 1. predict noise model_output
             model_output = self.unet(model_inputs, t).sample
+
+            if self.use_rendering:
+                model_output = model_output.reshape(B, T, 6, H, W)
+                model_output = torch.einsum("btnhw,btnhw->bthw", rendering_poses, model_output)
 
             # 2. compute previous image: x_t -> x_t-1
             image = self.scheduler.step(model_output, t, image).prev_sample  # , generator=generator).prev_sample
