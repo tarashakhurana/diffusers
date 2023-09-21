@@ -57,6 +57,73 @@ class GatedSelfAttentionDense(nn.Module):
 
 
 @maybe_allow_in_graph
+class RenderingTransformerBlock(nn.Module):
+
+    r"""
+    A Transformer block with only cross attention layer to process the per-pixel Plucker rays.
+
+    Parameters:
+        dim (`int`): The number of channels in the input and output.
+        num_attention_heads (`int`): The number of heads to use for multi-head attention.
+        attention_head_dim (`int`): The number of channels in each head.
+        dropout (`float`, *optional*, defaults to 0.0): The dropout probability to use.
+        cross_attention_dim (`int`, *optional*): The size of the encoder_hidden_states vector for cross attention.
+        attention_bias (:
+            obj: `bool`, *optional*, defaults to `False`): Configure if the attentions should contain a bias parameter.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        output_dim: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        dropout=0.0,
+        cross_attention_dim: Optional[int] = None,
+        attention_bias: bool = False,
+        upcast_attention: bool = False,
+        norm_elementwise_affine: bool = True,
+    ):
+        super().__init__()
+        self.norm = (
+                nn.LayerNorm(dim, elementwise_affine=norm_elementwise_affine)
+        )
+        self.attn = Attention(
+                query_dim=dim,
+                cross_attention_dim=cross_attention_dim,
+                heads=num_attention_heads,
+                dim_head=attention_head_dim,
+                dropout=dropout,
+                bias=attention_bias,
+                upcast_attention=upcast_attention,
+        )
+        self.final = nn.Linear(dim, output_dim)
+
+    def forward(
+        self,
+        hidden_states: torch.FloatTensor,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        cross_attention_kwargs: Dict[str, Any] = None,
+    ):
+        cross_attention_kwargs = cross_attention_kwargs.copy() if cross_attention_kwargs is not None else {}
+
+        if encoder_hidden_states.ndim == 4:
+            encoder_hidden_states = encoder_hidden_states.flatten(2, 3).transpose(1, 2)
+
+        norm_hidden_states = self.norm(hidden_states).permute(0, 3, 1, 2)
+        attn_output = self.attn(
+                norm_hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                attention_mask=encoder_attention_mask,
+                **cross_attention_kwargs,
+        )
+        attn_output = attn_output.permute(0, 2, 3, 1)
+        final_output = self.final(attn_output).permute(0, 3, 1, 2)
+        return final_output
+
+
+@maybe_allow_in_graph
 class BasicTransformerBlock(nn.Module):
     r"""
     A basic Transformer block.

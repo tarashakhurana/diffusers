@@ -27,7 +27,7 @@ from torchvision import transforms
 from tqdm.auto import tqdm
 
 import diffusers
-from diffusers import DDPMPipeline, DDPMScheduler, UNet2DModel
+from diffusers import DDPMPipeline, DDPMScheduler, UNet2DModel, UNet2DRenderModel
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, is_accelerate_version, is_tensorboard_available, is_wandb_available
@@ -77,7 +77,7 @@ def parse_args():
     parser.add_argument(
         "--masking_strategy",
         type=str,
-        default="all",
+        default="random",
         choices=["all", "none", "half", "random", "random-half"]
     )
     parser.add_argument(
@@ -163,7 +163,7 @@ def parse_args():
     parser.add_argument(
         "--resolution",
         type=int,
-        default=128,
+        default=64,
         help=(
             "The resolution for input images, all the images in the train/validation dataset will be resized to this"
             " resolution"
@@ -384,6 +384,13 @@ def get_full_repo_name(model_id: str, organization: Optional[str] = None, token:
 def main(args):
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
 
+    if args.use_rendering:
+        assert args.train_with_plucker_coords
+        assert args.prediction_type == "sample"
+        UNetModel = UNet2DRenderModel
+    else:
+        UNetModel = UNet2DModel
+
     # dump config
     os.makedirs(args.output_dir, exist_ok=True)
     with open(f"{args.output_dir}/config.json", "w") as f:
@@ -395,7 +402,7 @@ def main(args):
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.logger,
-        logging_dir=logging_dir,
+        project_dir=logging_dir,
         project_config=accelerator_project_config,
     )
 
@@ -423,7 +430,7 @@ def main(args):
 
         def load_model_hook(models, input_dir):
             if args.use_ema:
-                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DModel)
+                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNetModel)
                 ema_model.load_state_dict(load_model.state_dict())
                 ema_model.to(accelerator.device)
                 del load_model
@@ -433,7 +440,7 @@ def main(args):
                 model = models.pop()
 
                 # load diffusers style into model
-                load_model = UNet2DModel.from_pretrained(input_dir, subfolder="unet")
+                load_model = UNetModel.from_pretrained(input_dir, subfolder="unet")
                 model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
@@ -503,7 +510,7 @@ def main(args):
                 "AttnUpBlock2D",
             )
 
-        model = UNet2DModel(
+        model = UNetModel(
             sample_size=args.resolution,
             in_channels=args.in_channels,
             out_channels=args.out_channels,
@@ -513,8 +520,8 @@ def main(args):
             up_block_types=up_block_types,
         )
     else:
-        config = UNet2DModel.load_config(args.model_config_name_or_path)
-        model = UNet2DModel.from_config(config)
+        config = UNetModel.load_config(args.model_config_name_or_path)
+        model = UNetModel.from_config(config)
 
     print("Total number of parameters in model", model.num_parameters(only_trainable=True))
     print(summary(model))
@@ -527,7 +534,7 @@ def main(args):
             use_ema_warmup=True,
             inv_gamma=args.ema_inv_gamma,
             power=args.ema_power,
-            model_cls=UNet2DModel,
+            model_cls=UNetModel,
             model_config=model.config,
         )
 
@@ -672,7 +679,6 @@ def main(args):
                 clean_images = clean_images[:, :, None, :, :]
 
             if args.use_rendering:
-                assert args.train_with_plucker_coords
                 rendering_poses = clean_images[:, :, 1:, :, :]
                 clean_images = clean_images[:, :, :1, :, :]
 
@@ -696,7 +702,6 @@ def main(args):
                     noisy_images = torch.cat([noisy_depths[:, :, None, :, :], clean_images[:, :, 1:, :, :]], dim=2)
             else:
                 noisy_images = noisy_depths[:, :, None, :, :]
-
 
             # choose the type of masking strategy
             # remember that both the clean and noisy images are 5D tensors now
@@ -737,18 +742,16 @@ def main(args):
                     clean_images_masked.reshape(B, T*C, H, W),
                     mask_images.reshape(B, T, H, W)], dim=1)
 
+            if args.use_rendering:
+                rendering_poses = rendering_poses.reshape(B, -1, H, W).permute(0, 2, 3, 1)
 
             with accelerator.accumulate(model):
                 # Predict the noise residual
-                # timesteps_unet = torch.zeros((bsz,), device=clean_images.device).long()
-                model_output = model(model_inputs, timesteps).sample
 
                 if args.use_rendering:
-                    # model output should be devoid of the time dimension
-                    assert args.train_with_plucker_coords
-                    assert args.prediction_type == "sample"
-                    model_output = model_output.reshape(B, T, 6, H, W)
-                    model_output = torch.einsum("btnhw,btnhw->bthw", rendering_poses, model_output)
+                    model_output = model(model_inputs, rendering_poses, timesteps).sample
+                else:
+                    model_output = model(model_inputs, timesteps).sample
 
                 if args.loss_only_on_masked:
                     loss_indices = time_indices

@@ -20,7 +20,7 @@ from torch import nn
 
 from ..utils import is_torch_version, logging
 from .activations import get_activation
-from .attention import AdaGroupNorm
+from .attention import AdaGroupNorm, RenderingTransformerBlock
 from .attention_processor import Attention, AttnAddedKVProcessor, AttnAddedKVProcessor2_0
 from .dual_transformer_2d import DualTransformer2DModel
 from .resnet import Downsample2D, FirDownsample2D, FirUpsample2D, KDownsample2D, KUpsample2D, ResnetBlock2D, Upsample2D
@@ -28,6 +28,30 @@ from .transformer_2d import Transformer2DModel
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+
+def get_rendering_transformer_block(
+    dim: int,
+    output_dim: int,
+    num_attention_heads: int,
+    attention_head_dim: int,
+    dropout: float = 0.0,
+    cross_attention_dim: int = None,
+    attention_bias: bool = False,
+    upcast_attention: bool = False,
+    norm_elementwise_affine: bool = True,
+):
+    return RenderingTransformerBlock(
+        dim=dim,
+        output_dim=output_dim,
+        num_attention_heads=num_attention_heads,
+        attention_head_dim=attention_head_dim,
+        dropout=dropout,
+        cross_attention_dim=cross_attention_dim if cross_attention_dim is not None else dim,
+        attention_bias=attention_bias,
+        upcast_attention=upcast_attention,
+        norm_elementwise_affine=norm_elementwise_affine
+    )
 
 
 def get_down_block(

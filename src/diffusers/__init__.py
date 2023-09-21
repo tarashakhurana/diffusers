@@ -49,6 +49,7 @@ else:
         UNet1DModel,
         UNet2DConditionModel,
         UNet2DModel,
+        UNet2DRenderModel,
         UNet3DConditionModel,
         UNet4DVoxelModel,
         UNetStatic3DVoxelModel,
