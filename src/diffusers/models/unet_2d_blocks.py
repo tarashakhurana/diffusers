@@ -33,10 +33,12 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 def get_rendering_transformer_block(
     dim: int,
     output_dim: int,
+    mlp_hidden_dim: int,
     num_attention_heads: int,
     attention_head_dim: int,
     dropout: float = 0.0,
     cross_attention_dim: int = None,
+    cross_attention_norm: str = None,
     attention_bias: bool = False,
     upcast_attention: bool = False,
     norm_elementwise_affine: bool = True,
@@ -44,10 +46,12 @@ def get_rendering_transformer_block(
     return RenderingTransformerBlock(
         dim=dim,
         output_dim=output_dim,
+        mlp_hidden_dim=mlp_hidden_dim,
         num_attention_heads=num_attention_heads,
         attention_head_dim=attention_head_dim,
         dropout=dropout,
         cross_attention_dim=cross_attention_dim if cross_attention_dim is not None else dim,
+        cross_attention_norm=cross_attention_norm,
         attention_bias=attention_bias,
         upcast_attention=upcast_attention,
         norm_elementwise_affine=norm_elementwise_affine

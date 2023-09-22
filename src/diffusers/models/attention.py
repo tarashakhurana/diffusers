@@ -76,10 +76,12 @@ class RenderingTransformerBlock(nn.Module):
         self,
         dim: int,
         output_dim: int,
+        mlp_hidden_dim: int,
         num_attention_heads: int,
         attention_head_dim: int,
         dropout=0.0,
         cross_attention_dim: Optional[int] = None,
+        cross_attention_norm: Optional[str] = None,
         attention_bias: bool = False,
         upcast_attention: bool = False,
         norm_elementwise_affine: bool = True,
@@ -91,13 +93,20 @@ class RenderingTransformerBlock(nn.Module):
         self.attn = Attention(
                 query_dim=dim,
                 cross_attention_dim=cross_attention_dim,
+                cross_attention_norm=cross_attention_norm,
                 heads=num_attention_heads,
                 dim_head=attention_head_dim,
                 dropout=dropout,
                 bias=attention_bias,
                 upcast_attention=upcast_attention,
         )
-        self.final = nn.Linear(dim, output_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_hidden_dim, output_dim),
+            nn.Dropout(dropout)
+        )
 
     def forward(
         self,
@@ -119,7 +128,7 @@ class RenderingTransformerBlock(nn.Module):
                 **cross_attention_kwargs,
         )
         attn_output = attn_output.permute(0, 2, 3, 1)
-        final_output = self.final(attn_output).permute(0, 3, 1, 2)
+        final_output = self.mlp(attn_output).permute(0, 3, 1, 2)
         return final_output
 
 

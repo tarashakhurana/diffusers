@@ -110,6 +110,8 @@ class UNet2DRenderModel(ModelMixin, ConfigMixin):
         add_attention: bool = True,
         class_embed_type: Optional[str] = None,
         num_class_embeds: Optional[int] = None,
+        cross_attention_norm: str = "layer_norm",
+        mlp_hidden_dim: int = 128,
         num_attention_heads: int = 8,
         final_attention_head_dim: int = 64,
         query_channels: int = 72,
@@ -237,10 +239,12 @@ class UNet2DRenderModel(ModelMixin, ConfigMixin):
         self.render_by_attention = get_rendering_transformer_block(
             query_channels,
             render_out_channels,
+            mlp_hidden_dim=mlp_hidden_dim,
             num_attention_heads=num_attention_heads,
             attention_head_dim=final_attention_head_dim,
             dropout=attention_dropout,
             cross_attention_dim=out_channels,
+            cross_attention_norm=cross_attention_norm,
             attention_bias=attention_bias,
             upcast_attention=upcast_attention,
             norm_elementwise_affine=norm_elementwise_affine

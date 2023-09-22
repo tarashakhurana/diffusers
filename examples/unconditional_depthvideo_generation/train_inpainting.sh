@@ -1,0 +1,13 @@
+accelerate launch --main_process_port 29502 train_inpainting.py \
+    --train_data_dir /data/tkhurana/datasets/pointodyssey/minitrain/ \
+    --masking_strategy random \
+    --train_batch_size 4 \
+    --output_dir /data3/tkhurana/diffusers/logs/PointOdyssey-depth_minitrain_6s_random_masking_resolution64_with_correct_plucker_poseatrendering_renderoutchannels12_attentionwithMLP/ \
+    --resolution 64 \
+    --normalization_factor 65.535 \
+    --loss_in_2d \
+    --in_channels 36 \
+    --out_channels 12 \
+    --train_with_plucker_coords \
+    --use_rendering \
+    --prediction_type sample

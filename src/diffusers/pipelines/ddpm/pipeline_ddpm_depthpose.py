@@ -185,12 +185,14 @@ class DDPMDepthPoseInpaintingPipeline(DiffusionPipeline):
                     clean_images_masked.reshape(B, -1, H, W),
                     mask_images.reshape(B, T, H, W)], dim=1)
 
-            # 1. predict noise model_output
-            model_output = self.unet(model_inputs, t).sample
-
             if self.use_rendering:
-                model_output = model_output.reshape(B, T, 6, H, W)
-                model_output = torch.einsum("btnhw,btnhw->bthw", rendering_poses, model_output)
+                rendering_poses = rendering_poses.reshape(B, -1, H, W).permute(0, 2, 3, 1)
+
+            # 1. predict noise model_output
+            if self.use_rendering:
+                model_output = self.unet(model_inputs, rendering_poses, t).sample
+            else:
+                model_output = self.unet(model_inputs, t).sample
 
             # 2. compute previous image: x_t -> x_t-1
             image = self.scheduler.step(model_output, t, image).prev_sample  # , generator=generator).prev_sample

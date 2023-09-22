@@ -402,7 +402,7 @@ def main(args):
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.logger,
-        project_dir=logging_dir,
+        logging_dir=logging_dir,
         project_config=accelerator_project_config,
     )
 

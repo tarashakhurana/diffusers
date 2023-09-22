@@ -8,7 +8,7 @@ import numpy as np
 from PIL import Image
 from torchvision import transforms
 from diffusers import DDPMPipeline, DDPMDepthPoseInpaintingPipeline, DDPMInpaintingPipeline, DDPMReconstructionPipeline
-from diffusers import DPMSolverMultistepScheduler, UNet2DModel, DDPMScheduler, DDPMConditioningScheduler
+from diffusers import DPMSolverMultistepScheduler, UNet2DModel, UNet2DRenderModel, DDPMScheduler, DDPMConditioningScheduler
 import matplotlib.cm
 
 import utils
@@ -217,7 +217,13 @@ def parse_args():
 def main(args):
     # Initialize the UNet2D
     Scheduler = DDPMScheduler  # DDPMConditioningScheduler
-    unet = UNet2DModel.from_pretrained(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/unet")
+    if args.use_rendering:
+        assert args.train_with_plucker_coords
+        assert args.prediction_type == "sample"
+        UNetModel = UNet2DRenderModel
+    else:
+        UNetModel = UNet2DModel
+    unet = UNetModel.from_pretrained(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/unet")
     unet = unet.to("cuda:0")
 
     dataset = OccfusionDataset(
