@@ -79,7 +79,8 @@ class RenderingTransformerBlock(nn.Module):
         mlp_hidden_dim: int,
         num_attention_heads: int,
         attention_head_dim: int,
-        dropout=0.0,
+        dropout: float = 0.0,
+        residual_connection: bool = True,
         cross_attention_dim: Optional[int] = None,
         cross_attention_norm: Optional[str] = None,
         attention_bias: bool = False,
@@ -97,6 +98,7 @@ class RenderingTransformerBlock(nn.Module):
                 heads=num_attention_heads,
                 dim_head=attention_head_dim,
                 dropout=dropout,
+                residual_connection=residual_connection,
                 bias=attention_bias,
                 upcast_attention=upcast_attention,
         )
@@ -116,6 +118,10 @@ class RenderingTransformerBlock(nn.Module):
         cross_attention_kwargs: Dict[str, Any] = None,
     ):
         cross_attention_kwargs = cross_attention_kwargs.copy() if cross_attention_kwargs is not None else {}
+
+        hidden_states = hidden_states.permute(0, 3, 1, 2)
+        encoder_hidden_states = encoder_hidden_states.permute(0, 2, 3, 1)
+        hidden_states, encoder_hidden_states = encoder_hidden_states, hidden_states
 
         if encoder_hidden_states.ndim == 4:
             encoder_hidden_states = encoder_hidden_states.flatten(2, 3).transpose(1, 2)
