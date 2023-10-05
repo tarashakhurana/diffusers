@@ -47,7 +47,7 @@ class DDPMDepthPoseInpaintingPipeline(DiffusionPipeline):
     @torch.no_grad()
     def __call__(
         self,
-        inpainting_image: torch.cuda.FloatTensor,
+        inpainting_image: Union[torch.cuda.FloatTensor, Tuple],
         batch_size: int = 1,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         num_inference_steps: int = 1000,
@@ -93,7 +93,7 @@ class DDPMDepthPoseInpaintingPipeline(DiffusionPipeline):
             else:
                 image_shape = (
                     batch_size,
-                    12,
+                    4,
                     self.unet.config.sample_size,
                     self.unet.config.sample_size,
                 )
@@ -120,15 +120,15 @@ class DDPMDepthPoseInpaintingPipeline(DiffusionPipeline):
             # with the third dimension containing the plucker coords + depth map
             # otherwise the inpainting image is a 4D tensor with the second dimension
             # being the number of timesteps.
-            clean_images = inpainting_image
+            clean_images = inpainting_image[0]
 
             if not self.train_with_plucker_coords:
                 clean_images = clean_images[:, :, None, :, :]
 
             if self.use_rendering:
                 assert self.train_with_plucker_coords
-                rendering_poses = clean_images[:, :, 1:, :, :]
-                clean_images = clean_images[:, :, :1, :, :]
+                rendering_poses = inpainting_image[1]
+                clean_images = clean_images[:, :, None, :, :]
 
             B, T, C, H, W = clean_images.shape
             clean_depths = clean_images[:, :, 0, :, :]
@@ -156,7 +156,7 @@ class DDPMDepthPoseInpaintingPipeline(DiffusionPipeline):
             elif self.masking_strategy == "random" or self.masking_strategy == "random-half" or self.masking_strategy == "half":
                 # first pick a random number of frames to mask
                 # then pick above number of frame IDs to mask
-                num_masks = torch.randint(0, self.n_input + self.n_output, (1,)) + 1
+                num_masks = torch.randint(0, self.n_input + self.n_output - 1, (1,)) + 1
                 num_masks = num_masks.numpy()[0]
                 if self.masking_strategy == "random-half":
                     num_masks = self.n_input
@@ -186,11 +186,22 @@ class DDPMDepthPoseInpaintingPipeline(DiffusionPipeline):
                     mask_images.reshape(B, T, H, W)], dim=1)
 
             if self.use_rendering:
-                rendering_poses = rendering_poses.reshape(B, -1, H, W).permute(0, 2, 3, 1)
+                output_indices = time_indices.clone()
+                input_indices = torch.Tensor([i for i in range(self.n_input + self.n_output) if i not in output_indices]).int()
+                # output_indices = torch.Tensor([i for i in range(self.n_input + self.n_output)]).int()
+                # input_indices = torch.Tensor([i for i in range(self.n_input + self.n_output)]).int()
+                # print("rendering poses befire", rendering_poses)
+                # rendering_poses[:, output_indices, :] = rendering_poses[:, output_indices, :] + 1.0
+                # print("rendering poses after", rendering_poses)
 
-            # 1. predict noise model_output
+
             if self.use_rendering:
-                model_output = self.unet(model_inputs, rendering_poses, t).sample
+                model_output = self.unet(
+                            model_inputs,
+                            t,
+                            encoder_hidden_states=rendering_poses,
+                            input_indices=input_indices,
+                            output_indices=output_indices).sample
             else:
                 model_output = self.unet(model_inputs, t).sample
 

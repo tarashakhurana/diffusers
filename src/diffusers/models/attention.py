@@ -88,7 +88,10 @@ class RenderingTransformerBlock(nn.Module):
         norm_elementwise_affine: bool = True,
     ):
         super().__init__()
-        self.norm = (
+        self.norm1 = (
+                nn.LayerNorm(dim, elementwise_affine=norm_elementwise_affine)
+        )
+        self.norm2 = (
                 nn.LayerNorm(dim, elementwise_affine=norm_elementwise_affine)
         )
         self.attn = Attention(
@@ -106,9 +109,12 @@ class RenderingTransformerBlock(nn.Module):
             nn.Linear(dim, mlp_hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(mlp_hidden_dim, output_dim),
-            nn.Dropout(dropout)
+            nn.Linear(mlp_hidden_dim, dim),
         )
+        self.feedforward = None
+        if output_dim != dim:
+            self.feedforward = nn.Linear(dim, output_dim)
+
 
     def forward(
         self,
@@ -117,16 +123,15 @@ class RenderingTransformerBlock(nn.Module):
         encoder_attention_mask: Optional[torch.FloatTensor] = None,
         cross_attention_kwargs: Dict[str, Any] = None,
     ):
-        cross_attention_kwargs = cross_attention_kwargs.copy() if cross_attention_kwargs is not None else {}
+        # both hidden states and encoder hidden states are going to be of shape B x C x H x W
+        hidden_states = hidden_states.permute(0, 2, 3, 1)
 
-        hidden_states = hidden_states.permute(0, 3, 1, 2)
-        encoder_hidden_states = encoder_hidden_states.permute(0, 2, 3, 1)
-        hidden_states, encoder_hidden_states = encoder_hidden_states, hidden_states
+        cross_attention_kwargs = cross_attention_kwargs.copy() if cross_attention_kwargs is not None else {}
 
         if encoder_hidden_states.ndim == 4:
             encoder_hidden_states = encoder_hidden_states.flatten(2, 3).transpose(1, 2)
 
-        norm_hidden_states = self.norm(hidden_states).permute(0, 3, 1, 2)
+        norm_hidden_states = self.norm1(hidden_states).permute(0, 3, 1, 2)
         attn_output = self.attn(
                 norm_hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
@@ -134,8 +139,10 @@ class RenderingTransformerBlock(nn.Module):
                 **cross_attention_kwargs,
         )
         attn_output = attn_output.permute(0, 2, 3, 1)
-        final_output = self.mlp(attn_output).permute(0, 3, 1, 2)
-        return final_output
+        final_output = attn_output + self.mlp(self.norm2(attn_output))
+        if self.feedforward is not None:
+            final_output = self.feedforward(final_output)
+        return final_output.permute(0, 3, 1, 2)
 
 
 @maybe_allow_in_graph

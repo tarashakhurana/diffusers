@@ -48,6 +48,7 @@ else:
         Transformer2DModel,
         UNet1DModel,
         UNet2DConditionModel,
+        UNet2DConditionRenderModel,
         UNet2DModel,
         UNet2DRenderModel,
         UNet3DConditionModel,

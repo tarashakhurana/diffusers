@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import Dataset
 from accelerate import Accelerator
+from accelerate import DistributedDataParallelKwargs
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration
 from datasets import load_dataset
@@ -27,7 +28,7 @@ from torchvision import transforms
 from tqdm.auto import tqdm
 
 import diffusers
-from diffusers import DDPMPipeline, DDPMScheduler, UNet2DModel, UNet2DRenderModel
+from diffusers import DDPMPipeline, DDPMScheduler, UNet2DModel, UNet2DConditionRenderModel
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, is_accelerate_version, is_tensorboard_available, is_wandb_available
@@ -35,7 +36,7 @@ from diffusers.utils.import_utils import is_xformers_available
 
 import utils
 from utils import HarmonicEmbedding, write_pointcloud
-from data import OccfusionDataset, collate_fn_depthpose, collate_fn_inpainting
+from data import DebugDataset, OccfusionDataset, collate_fn_depthpose, collate_fn_inpainting
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.16.0.dev0")
@@ -78,7 +79,7 @@ def parse_args():
         "--masking_strategy",
         type=str,
         default="random",
-        choices=["all", "none", "half", "random", "random-half"]
+        choices=["all", "none", "half", "random", "random-half", "custom"]
     )
     parser.add_argument(
         "--dataset_config_name",
@@ -153,6 +154,7 @@ def parse_args():
     parser.add_argument("--overwrite_output_dir", action="store_true")
     parser.add_argument("--bigger_model", action="store_true")
     parser.add_argument("--visualize_dataloader", action="store_true")
+    parser.add_argument("--shuffle_video", action="store_true")
     parser.add_argument("--use_harmonic", action="store_true")
     parser.add_argument(
         "--cache_dir",
@@ -365,7 +367,7 @@ def parse_args():
     if args.dataset_name is None and args.train_data_dir is None:
         raise ValueError("You must specify either a dataset name from the hub or a train data directory.")
 
-    assert args.n_input + args.n_output == args.num_images
+    # assert args.n_input + args.n_output == args.num_images
     assert args.loss_in_2d or args.loss_in_3d, "at least one loss should be specified"
 
     return args
@@ -386,8 +388,8 @@ def main(args):
 
     if args.use_rendering:
         assert args.train_with_plucker_coords
-        assert args.prediction_type == "sample"
-        UNetModel = UNet2DRenderModel
+        # assert args.prediction_type == "sample"
+        UNetModel = UNet2DConditionRenderModel
     else:
         UNetModel = UNet2DModel
 
@@ -397,6 +399,7 @@ def main(args):
         json.dump(args.__dict__, f, indent=4)
 
     accelerator_project_config = ProjectConfiguration(total_limit=args.checkpoints_total_limit)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -404,6 +407,7 @@ def main(args):
         log_with=args.logger,
         logging_dir=logging_dir,
         project_config=accelerator_project_config,
+        # kwargs_handlers=[ddp_kwargs]
     )
 
     if args.logger == "tensorboard":
@@ -484,7 +488,7 @@ def main(args):
     # Initialize the model
     if args.model_config_name_or_path is None:
         if args.bigger_model:
-            block_out_channels=(128, 256, 256, 512)
+            block_out_channels=(128, 256, 256, 64 * args.num_images)
             down_block_types = (
                 "AttnDownBlock2D",
                 "AttnDownBlock2D",
@@ -498,7 +502,7 @@ def main(args):
                 "AttnUpBlock2D",
             )
         else:
-            block_out_channels=(128, 256, 512)
+            block_out_channels=(128, 256, 64 * args.num_images)
             down_block_types = (
                 "AttnDownBlock2D",
                 "AttnDownBlock2D",
@@ -509,16 +513,42 @@ def main(args):
                 "AttnUpBlock2D",
                 "AttnUpBlock2D",
             )
-
-        model = UNetModel(
-            sample_size=args.resolution,
-            in_channels=args.in_channels,
-            out_channels=args.out_channels,
-            layers_per_block=2,
-            block_out_channels=block_out_channels,
-            down_block_types=down_block_types,
-            up_block_types=up_block_types,
-        )
+        if not args.use_rendering:
+            model = UNetModel(
+                sample_size=args.resolution,
+                in_channels=args.in_channels,
+                out_channels=args.out_channels,
+                layers_per_block=2,
+                block_out_channels=block_out_channels,
+                down_block_types=down_block_types,
+                up_block_types=up_block_types,
+            )
+        else:
+            st = torch.load("diffusion_pytorch_model.bin")
+            model = UNetModel(
+                sample_size=args.resolution,
+                in_channels=args.in_channels,
+                out_channels=args.out_channels,
+                cross_attention_dim=1280,  # 36,
+                act_fn="silu",
+                attention_head_dim=8,
+                block_out_channels=[320, 640, 1280, 1280],
+                center_input_sample=False,
+                downsample_padding=1,
+                flip_sin_to_cos=True,
+                freq_shift=0,
+                layers_per_block=2,
+                mid_block_scale_factor=1,
+                norm_eps=1e-05,
+                norm_num_groups=32
+            )
+            for name, params in model.named_parameters():
+                if name in st:
+                    if 'attn2' in name:
+                        continue
+                    else:
+                        params.data = st[f'{name}']
+                        # params.requires_grad = False
     else:
         config = UNetModel.load_config(args.model_config_name_or_path)
         model = UNetModel.from_config(config)
@@ -571,6 +601,7 @@ def main(args):
         eps=args.adam_epsilon,
     )
 
+    """
     dataset = OccfusionDataset(
         instance_data_root=args.train_data_dir,
         size=args.resolution,
@@ -579,15 +610,26 @@ def main(args):
         offset=args.offset,
         normalization_factor=args.normalization_factor,
         plucker_coords=args.train_with_plucker_coords,
+        plucker_resolution=[64, 32, 16] if args.use_rendering else [64],
+        shuffle_video=args.shuffle_video,
         use_harmonic=args.use_harmonic,
+        visualize=args.visualize_dataloader
+    )
+    """
+
+    dataset = DebugDataset(
+        instance_data_root=args.train_data_dir,
+        size=args.resolution,
+        center_crop=args.center_crop,
+        num_images=args.num_images,
+        offset=args.offset,
+        split="train",
+        normalization_factor=args.normalization_factor,
         visualize=args.visualize_dataloader
     )
 
     if args.train_with_plucker_coords:
-        if args.use_rendering:
-            collate_fn = collate_fn_inpainting
-        else:
-            collate_fn = collate_fn_depthpose
+        collate_fn = collate_fn_depthpose
     else:
         collate_fn = collate_fn_inpainting
 
@@ -643,7 +685,7 @@ def main(args):
         else:
             # Get the most recent checkpoint
             dirs = os.listdir(args.output_dir)
-            dirs = [d for d in dirs if dtartswith("checkpoint")]
+            dirs = [d for d in dirs if d.startswith("checkpoint")]
             dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
             path = dirs[-1] if len(dirs) > 0 else None
 
@@ -679,8 +721,8 @@ def main(args):
                 clean_images = clean_images[:, :, None, :, :]
 
             if args.use_rendering:
-                rendering_poses = clean_images[:, :, 1:, :, :]
-                clean_images = clean_images[:, :, :1, :, :]
+                rendering_poses = batch["plucker_coords"]
+                clean_images = clean_images[:, :, None, :, :]
 
             B, T, C, H, W = clean_images.shape
             clean_depths = clean_images[:, :, 0, :, :]
@@ -715,18 +757,24 @@ def main(args):
                 # merge the timesteps and height dimension of all voxel grids
                 model_inputs = noisy_images.reshape(B, T*C, H, W)
 
-            elif args.masking_strategy == "random" or args.masking_strategy == "random-half" or args.masking_strategy == "half":
+            elif args.masking_strategy in ["random", "random-half", "half", "custom"]:
                 # first pick a random number of frames to mask
                 # then pick above number of frame IDs to mask
-                num_masks = torch.randint(0, args.n_input + args.n_output, (1,)) + 1
+                num_masks = torch.randint(0, args.n_input + args.n_output - 1, (1,)) + 1
                 num_masks = num_masks.numpy()[0]
+
                 if args.masking_strategy == "random-half":
                     num_masks = args.n_input
+
                 time_indices = torch.from_numpy(
                     np.random.choice(args.n_input + args.n_output, size=(num_masks, ), replace=False)
                 )
+
                 if args.masking_strategy == "half":
                     time_indices = torch.arange(args.n_input, args.n_input + args.n_output, 1)
+                if args.masking_strategy == "custom":
+                    time_indices = torch.Tensor([args.num_images]).int()
+
                 mask_images = torch.zeros_like(clean_images[:, :, 0, :, :]) # 4d
                 mask_images[:, time_indices, ...] = torch.ones_like(clean_images[:, time_indices, 0, ...])
                 clean_depths_masked = clean_depths * (1 - mask_images)
@@ -742,14 +790,23 @@ def main(args):
                     clean_images_masked.reshape(B, T*C, H, W),
                     mask_images.reshape(B, T, H, W)], dim=1)
 
+
             if args.use_rendering:
-                rendering_poses = rendering_poses.reshape(B, -1, H, W).permute(0, 2, 3, 1)
+                output_indices = time_indices.clone()
+                input_indices = torch.Tensor([i for i in range(args.n_input + args.n_output) if i not in output_indices]).int()
+                # output_indices = torch.Tensor([i for i in range(args.n_input + args.n_output)]).int()
+                # input_indices = torch.Tensor([i for i in range(args.n_input + args.n_output)]).int()
 
             with accelerator.accumulate(model):
                 # Predict the noise residual
 
                 if args.use_rendering:
-                    model_output = model(model_inputs, rendering_poses, timesteps).sample
+                    model_output = model(
+                            model_inputs,
+                            timesteps,
+                            encoder_hidden_states=rendering_poses,
+                            input_indices=input_indices,
+                            output_indices=output_indices).sample
                 else:
                     model_output = model(model_inputs, timesteps).sample
 

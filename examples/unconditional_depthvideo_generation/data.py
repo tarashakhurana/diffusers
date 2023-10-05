@@ -12,6 +12,7 @@ import accelerate
 import datasets
 import torch
 from einops import repeat
+from collections import defaultdict
 from copy import deepcopy
 import numpy as np
 import torch.nn.functional as F
@@ -236,14 +237,23 @@ def collate_fn_depthpose(examples):
     inputs = torch.stack([example["input"] for example in examples])
     inputs = inputs.to(memory_format=torch.contiguous_format).float()
 
-    ray_origin = torch.stack([example["ray_origin"] for example in examples])
-    ray_origin = ray_origin.to(memory_format=torch.contiguous_format).float()
+    """
+    num_res = len(examples[0]["plucker_coords"])
+    plucker_coords = [torch.stack([example["plucker_coords"][res] for example in examples]) for res in range(num_res)]
+    plucker_coords = [pc.to(memory_format=torch.contiguous_format).float() for pc in plucker_coords]
+    """
 
-    image_plane_in_cam = torch.stack([example["image_plane_in_cam"] for example in examples])
-    image_plane_in_cam = image_plane_in_cam.to(memory_format=torch.contiguous_format).float()
+    plucker_coords = torch.stack([example["plucker_coords"] for example in examples])
+    plucker_coords = plucker_coords.to(memory_format=torch.contiguous_format).float()
 
-    Rt = torch.stack([example["Rt"] for example in examples])
-    Rt = Rt.to(memory_format=torch.contiguous_format).float()
+    # ray_origin = torch.stack([example["ray_origin"] for example in examples])
+    # ray_origin = ray_origin.to(memory_format=torch.contiguous_format).float()
+
+    # image_plane_in_cam = torch.stack([example["image_plane_in_cam"] for example in examples])
+    # image_plane_in_cam = image_plane_in_cam.to(memory_format=torch.contiguous_format).float()
+
+    # Rt = torch.stack([example["Rt"] for example in examples])
+    # Rt = Rt.to(memory_format=torch.contiguous_format).float()
 
     # ray_direction = torch.stack([example["ray_direction"] for example in examples])
     # ray_direction = ray_direction.to(memory_format=torch.contiguous_format).float()
@@ -255,9 +265,10 @@ def collate_fn_depthpose(examples):
 
     return {
         "input": inputs,
-        "ray_origin": ray_origin,
-        "image_plane_in_cam": image_plane_in_cam,
-        "Rt": Rt,
+        "plucker_coords": plucker_coords,
+        # "ray_origin": ray_origin,
+        # "image_plane_in_cam": image_plane_in_cam,
+        # "Rt": Rt,
         "filenames": filenames
     }
 
@@ -287,6 +298,8 @@ class OccfusionDataset(Dataset):
         center_crop=True,
         normalization_factor=20480.0,
         plucker_coords=False,
+        plucker_resolution=256,
+        shuffle_video=False,
         use_harmonic=False,
         visualize=False,
         spiral_poses=False
@@ -295,9 +308,11 @@ class OccfusionDataset(Dataset):
         self.offset = offset
         self.center_crop = center_crop
         self.num_images = num_images
+        self.shuffle_video = shuffle_video
         self.visualize = visualize
         self.normalization_factor = normalization_factor
         self.plucker_coords = plucker_coords
+        self.plucker_resolution = plucker_resolution
         self.use_harmonic = use_harmonic
         self.spiral_poses = spiral_poses
         self.sequence = num_images > 1
@@ -405,6 +420,7 @@ class OccfusionDataset(Dataset):
         depth_frames = []
         all_filenames = []
         all_ray_origin = []
+        plucker_frames = defaultdict(list)
         all_ray_dirs_unnormalized = []
         all_cam_coords = []
         all_rt = []
@@ -433,74 +449,82 @@ class OccfusionDataset(Dataset):
                 # just to be sure, clip away all values beyond the range of 0-1
                 depth_clipped = np.clip(depth, 0, 1)
                 depth = depth_clipped * 255.0
-                depth_to_visualize = transforms.Resize(self.size, interpolation=transforms.InterpolationMode.NEAREST)(torch.from_numpy(depth_clipped[None, ...]))
+                # depth_to_visualize = transforms.Resize(self.size, interpolation=transforms.InterpolationMode.NEAREST)(torch.from_numpy(depth_clipped[None, ...]))
             else:
                 # in TAO, we predicted per frame relative depth
                 depth = (depth - depth.min()) / (depth.max() - depth.min()) * 255.0
 
             depth_preprocessed = self.image_transforms(Image.fromarray(depth.astype("uint8"))).squeeze()
-            scale = depth_preprocessed.shape[0] / depth.shape[0]
-            H, W = depth.shape[0] * scale, depth.shape[1] * scale
-            H, W = int(H), int(W)
 
             if self.plucker_coords:
-                K_beforescale = self.intrinsics[ref_index - i]
-                K = K_beforescale.clone()
-                # account for the image resizing operation
-                K[0] *= scale
-                K[1] *= scale
+                multires_plucker_coords = []
+                for res in self.plucker_resolution:
+                    plucker_scale = res / depth.shape[0]
+                    H, W = depth.shape[0] * plucker_scale, depth.shape[1] * plucker_scale
+                    H, W = int(H), int(W)
+                    K_beforescale = self.intrinsics[ref_index - i]
+                    K = K_beforescale.clone()
+                    # account for the image resizing operation
+                    K[0] *= plucker_scale
+                    K[1] *= plucker_scale
 
-                # Rt = self.extrinsics[ref_index - i]
-                # Rt_inv = torch.linalg.inv(Rt)
+                    # Rt = self.extrinsics[ref_index - i]
+                    # Rt_inv = torch.linalg.inv(Rt)
 
-                curr_from_global = self.extrinsics[ref_index - i]
-                global_from_curr = torch.linalg.inv(curr_from_global)
+                    curr_from_global = self.extrinsics[ref_index - i]
+                    global_from_curr = torch.linalg.inv(curr_from_global)
 
-                ref_from_curr = ref_from_global @ global_from_curr
-                Rt_inv = ref_from_curr
-                Rt = torch.linalg.inv(ref_from_curr)  # curr_from_ref
+                    ref_from_curr = ref_from_global @ global_from_curr
+                    Rt_inv = ref_from_curr
+                    Rt = torch.linalg.inv(ref_from_curr)  # curr_from_ref
 
-                ray_origins, ray_dirs, image_rays_in_cam = utils.get_plucker(K, Rt, H, W, return_image_plane=True)
-                plucker_rays = utils.encode_plucker(ray_origins, ray_dirs)
-                plucker_map = transforms.CenterCrop(self.size)(plucker_rays.reshape(H, W, -1).permute(2, 0, 1))
-                # image_plane_in_cam = image_rays_in_cam.reshape(-1, H, W)
-                image_plane_in_cam = transforms.CenterCrop(self.size)(image_rays_in_cam.reshape(-1, H, W))
-                depth_with_plucker_map = torch.cat([depth_preprocessed[None, ...], plucker_map], dim=0)
+                    ray_origins, ray_dirs, image_rays_in_cam = utils.get_plucker(K, Rt, H, W, return_image_plane=True)
+                    plucker_rays = utils.encode_plucker(ray_origins, ray_dirs)
+                    plucker_map = transforms.CenterCrop(res)(plucker_rays.reshape(H, W, -1).permute(2, 0, 1))
+                    # image_plane_in_cam = image_rays_in_cam.reshape(-1, H, W)
+                    image_plane_in_cam = transforms.CenterCrop(res)(image_rays_in_cam.reshape(-1, H, W))
 
-                depth_frames.append(depth_with_plucker_map)
-                # ray_dirs_preprocess = transforms.CenterCrop(self.size)(ray_dirs_unnormalized[:3, :].reshape(3, H, W)).permute(1, 2, 0).reshape(-1, 3)
-                all_ray_origin.append(ray_origins[0][None, :])
-                all_image_plane_in_cam.append(image_plane_in_cam)
-                # all_ray_dirs_unnormalized.append(ray_dirs_preprocess)
-                # all_cam_coords.append(cam_coords.T)
-                all_rt.append(Rt)
-                all_k.append(K)
+                    plucker_frames[i].append(plucker_map)
+                    # ray_dirs_preprocess = transforms.CenterCrop(self.size)(ray_dirs_unnormalized[:3, :].reshape(3, H, W)).permute(1, 2, 0).reshape(-1, 3)
+                    all_ray_origin.append(ray_origins[0][None, :])
+                    all_image_plane_in_cam.append(image_plane_in_cam)
+                    # all_ray_dirs_unnormalized.append(ray_dirs_preprocess)
+                    # all_cam_coords.append(cam_coords.T)
+                    all_rt.append(Rt)
+                    all_k.append(K)
 
-                """
-                if self.visualize:
-                    # depth_to_visualize = transforms.CenterCrop(self.size)(depth_to_visualize)
-                    depth_to_visualize = (depth_preprocessed / 2 + 0.5).clamp(0, 1)
-                    points_in_3d = utils.get_points_given_imageplane(image_plane_in_cam, depth_to_visualize, Rt, 100.0)
-                    all_points.append(points_in_3d.numpy().T)
-                    edges = np.arange(all_points[-1].shape[0]) + 1 + offset
-                    edges = np.hstack([np.zeros((all_points[-1].shape[0], 1)) + offset, edges[:, None]])
-                    all_edges.append(edges.astype(int))
-                    all_colors.append(np.zeros_like(all_points[-1]) + 19 * (i+1))
-                    offset += all_points[-1].shape[0]
-                """
+                    """
+                    if self.visualize:
+                        # depth_to_visualize = transforms.CenterCrop(self.size)(depth_to_visualize)
+                        depth_to_visualize = (depth_preprocessed / 2 + 0.5).clamp(0, 1)
+                        points_in_3d = utils.get_points_given_imageplane(image_plane_in_cam, depth_to_visualize, Rt, 100.0)
+                        all_points.append(points_in_3d.numpy().T)
+                        edges = np.arange(all_points[-1].shape[0]) + 1 + offset
+                        edges = np.hstack([np.zeros((all_points[-1].shape[0], 1)) + offset, edges[:, None]])
+                        all_edges.append(edges.astype(int))
+                        all_colors.append(np.zeros_like(all_points[-1]) + 19 * (i+1))
+                        offset += all_points[-1].shape[0]
+                    """
 
+                depth_frames.append(depth_preprocessed[None, ...])
             else:
                 depth_frames.append(depth_preprocessed)
 
         depth_video = torch.stack(depth_frames, axis=0)
 
         if self.plucker_coords:
-            all_ray_origin = torch.stack(all_ray_origin, axis=0)
-            all_image_plane_in_cam = torch.stack(all_image_plane_in_cam, axis=0)
+            num_res = len(self.plucker_resolution)
+            plucker_video = []
+            for r in range(num_res):
+                video_per_res = torch.stack([plucker_frames[i][r] for i in range(self.num_images)], axis=0)
+                plucker_video.append(video_per_res)
+            # all_ray_origin = torch.stack(all_ray_origin, axis=0)
+            # all_image_plane_in_cam = torch.stack(all_image_plane_in_cam, axis=0)
             all_rt = torch.stack(all_rt, axis=0)
             # all_ray_dirs_unnormalized = torch.stack(all_ray_dirs_unnormalized, axis=0)
             # all_cam_coords = torch.stack(all_cam_coords, axis=0)
 
+            # TODO will not work with the existing implementation of the pluckercoords
             if self.spiral_poses:
                 middle_pose = np.zeros((1, 3, 5))
                 middle_K = all_k[6]
@@ -524,14 +548,15 @@ class OccfusionDataset(Dataset):
                     plt.show()
 
                 render_poses = torch.from_numpy(render_poses[:, :3, :4])
+                plucker_video = plucker_video.unsqueeze(0).repeat(12, 1, 1, 1, 1)
                 depth_video = depth_video.unsqueeze(0).repeat(12, 1, 1, 1, 1)
                 for p in range(12):
                     pose = render_poses[p]
                     pose_homo = torch.cat([pose, torch.Tensor([[0.0, 0.0, 0.0, 1.0]])], dim=0).float()
                     render_ray_origins, render_ray_dirs = utils.get_plucker(middle_K, torch.linalg.inv(pose_homo), H, W)
                     render_plucker_rays = utils.encode_plucker(render_ray_origins, render_ray_dirs)
-                    render_plucker_map = transforms.CenterCrop(self.size)(render_plucker_rays.reshape(H, W, -1).permute(2, 0, 1))
-                    depth_video[p, 6, 1:, ...] = render_plucker_map
+                    render_plucker_map = transforms.CenterCrop(self.plucker_resolution)(render_plucker_rays.reshape(H, W, -1).permute(2, 0, 1))
+                    plucker_video[p, 6, ...] = render_plucker_map
 
         """
         if self.visualize:
@@ -541,12 +566,465 @@ class OccfusionDataset(Dataset):
             utils.write_pointcloud(f"/data/tkhurana/visualizations/plucker/{ref_index}.ply", all_points, rgb_points=all_colors)
         """
 
+        if self.shuffle_video:
+            random_indices = torch.randperm(self.num_images)
+            depth_video = depth_video[random_indices]
+            if self.plucker_coords:
+                plucker_video = [pv[random_indices] for pv in plucker_video]
+
         example["input"] = depth_video  # video is of shape T x H x W or T x C x H x W
         example["filenames"] = all_filenames
         if self.plucker_coords:
-            example["ray_origin"] = all_ray_origin
-            example["image_plane_in_cam"] = all_image_plane_in_cam
+            example["plucker_coords"] = plucker_video
+            # example["ray_origin"] = all_ray_origin
+            # example["image_plane_in_cam"] = all_image_plane_in_cam
             example["Rt"] = all_rt
             # example["ray_direction"] = all_ray_dirs_unnormalized
             # example["cam_coords"] = all_cam_coords
         return example
+
+
+class ObjaverseDataset(Dataset):
+    """
+    A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
+    It pre-processes the images and the tokenizes prompts.
+    """
+
+    def __init__(
+        self,
+        instance_data_root,
+        size=64,
+        num_images=12,
+        ext=["png"],
+        center_crop=True,
+        normalization_factor=1,
+        plucker_coords=False,
+        plucker_resolution=[64],
+        shuffle_video=False,
+        use_harmonic=False,
+        visualize=False,
+        spiral_poses=False
+    ):
+        self.size = size
+        self.offset = offset
+        self.center_crop = center_crop
+        self.num_images = num_images
+        self.shuffle_video = shuffle_video
+        self.visualize = visualize
+        self.normalization_factor = normalization_factor
+        self.plucker_coords = plucker_coords
+        self.plucker_resolution = plucker_resolution
+        self.use_harmonic = use_harmonic
+        self.spiral_poses = spiral_poses
+        self.sequence = num_images > 1
+
+        self.instance_data_root = Path(instance_data_root)
+        if not self.instance_data_root.exists():
+            raise ValueError(f"Instance {self.instance_data_root} images root doesn't exists.")
+
+        if self.plucker_coords:
+            self.harmonic_embedding = utils.HarmonicEmbedding()
+
+        # NOTE:
+        self.sequences = []
+        self.filenames = []
+        self.valid_indices = []
+        self.extrinsics = []
+        self.intrinsics = []
+        all_frames = []
+        seq_to_frames = {}
+        seq_to_ann = {}
+
+        for e in ext:
+            all_frames.extend(sorted(list(self.instance_data_root.rglob(f"*.{e}"))))
+
+        all_frames = list(all_frames)
+
+        self.paths = all_frames
+
+        if self.sequence:
+            for frame in all_frames:
+                seq = str(frame)[len(str(self.instance_data_root)) + 1:str(frame).rfind("/")]
+                if seq not in seq_to_frames:
+                    seq_to_frames[seq] = []
+                seq_to_frames[seq].append(frame)
+                if self.plucker_coords:
+                    seq_to_ann[seq] = os.path.join(self.instance_data_root, seq, "../annotations.npz")
+
+            for seq in seq_to_frames:
+                frames = seq_to_frames[seq]
+                start_index = len(self.filenames)
+                if self.plucker_coords:
+                    extrinsics = np.load(seq_to_ann[seq])["extrinsics"].astype(np.float32)
+                    intrinsics = np.load(seq_to_ann[seq])["intrinsics"].astype(np.float32)
+                    # some intrinsics matrices are invalid
+                    if np.sum(intrinsics[0].astype(int)) == 1: #  or int(intrinsics[0][2][2]) != 1 or int(intrinsics[0][0][0]) == 0 or int(intrinsics[0][1][1]) == 0:
+                        continue
+
+                    assert len(frames) == extrinsics.shape[0] == intrinsics.shape[0]
+
+                for idx in range(0, len(frames), self.offset):
+                    frame_path = frames[idx]
+                    self.sequences.append(seq)
+                    self.filenames.append(frame_path)
+                    if self.plucker_coords:
+                        R1 = np.array([[1, 0, 0, 0], [0, 0, -1, 0], [0, 1, 0, 0], [0, 0, 0, 1]])
+                        R2 = np.array([[-1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]])
+
+                        extrinsic = R2 @ extrinsics[idx] @ R1
+                        self.extrinsics.append(torch.from_numpy(extrinsic.astype(np.float32)))
+                        self.intrinsics.append(torch.from_numpy(intrinsics[0]))
+
+                #
+                end_index = len(self.filenames)
+                #
+                valid_start_index = start_index + self.num_images # (self.n_input // 10)
+                valid_end_index = end_index
+                self.valid_indices += list(range(valid_start_index, valid_end_index))
+        self.num_instance_images = len(self.valid_indices)
+        self._length = self.num_instance_images
+
+        print("found length to be", self._length)
+
+        self.image_transforms = transforms.Compose(
+            [
+                transforms.Resize(size, interpolation=transforms.InterpolationMode.NEAREST),
+                transforms.CenterCrop(size),
+                transforms.ToTensor(),
+                # brings the training data between -1 and 1
+                transforms.Normalize([0.5], [0.5]),
+            ]
+        )
+
+    def __len__(self):
+        return self._length
+
+    def encode_plucker(self, ray_origins, ray_dirs):
+        """
+        ray to plucker w/ pos encoding
+        """
+        plucker = torch.cat((ray_dirs, torch.cross(ray_origins, ray_dirs, dim=-1)), dim=-1)
+        if self.use_harmonic:
+            plucker = self.harmonic_embedding(plucker)
+        return plucker
+
+    def __getitem__(self, index):
+        example = {}
+        ref_index = self.valid_indices[index]
+        ref_seq = self.sequences[ref_index]
+        if self.plucker_coords:
+            ref_from_global = self.extrinsics[ref_index]
+        depth_frames = []
+        all_filenames = []
+        all_ray_origin = []
+        plucker_frames = defaultdict(list)
+        all_ray_dirs_unnormalized = []
+        all_cam_coords = []
+        all_rt = []
+        all_image_plane_in_cam = []
+        all_k = []
+
+        if self.visualize:
+            all_points = []
+            all_edges = []
+            all_colors = []
+            offset = 0
+
+        for i in range(self.num_images):
+            all_filenames.append(self.filenames[ref_index - i])
+
+            curr_seq = self.sequences[ref_index - i]
+            assert ref_seq == curr_seq
+
+            depth = cv2.imread(str(self.filenames[ref_index - i]), cv2.IMREAD_ANYDEPTH)
+
+            depth = depth.astype(np.float32) / self.normalization_factor
+
+            if "pointodyssey" in str(self.filenames[ref_index - i]):
+                depth = np.where(depth > 100.0, 100.0, depth)
+                depth = depth / 100.0
+                # just to be sure, clip away all values beyond the range of 0-1
+                depth_clipped = np.clip(depth, 0, 1)
+                depth = depth_clipped * 255.0
+                # depth_to_visualize = transforms.Resize(self.size, interpolation=transforms.InterpolationMode.NEAREST)(torch.from_numpy(depth_clipped[None, ...]))
+            else:
+                # in TAO, we predicted per frame relative depth
+                depth = (depth - depth.min()) / (depth.max() - depth.min()) * 255.0
+
+            depth_preprocessed = self.image_transforms(Image.fromarray(depth.astype("uint8"))).squeeze()
+
+            if self.plucker_coords:
+                multires_plucker_coords = []
+                for res in self.plucker_resolution:
+                    plucker_scale = res / depth.shape[0]
+                    H, W = depth.shape[0] * plucker_scale, depth.shape[1] * plucker_scale
+                    H, W = int(H), int(W)
+                    K_beforescale = self.intrinsics[ref_index - i]
+                    K = K_beforescale.clone()
+                    # account for the image resizing operation
+                    K[0] *= plucker_scale
+                    K[1] *= plucker_scale
+
+                    # Rt = self.extrinsics[ref_index - i]
+                    # Rt_inv = torch.linalg.inv(Rt)
+
+                    curr_from_global = self.extrinsics[ref_index - i]
+                    global_from_curr = torch.linalg.inv(curr_from_global)
+
+                    ref_from_curr = ref_from_global @ global_from_curr
+                    Rt_inv = ref_from_curr
+                    Rt = torch.linalg.inv(ref_from_curr)  # curr_from_ref
+
+                    ray_origins, ray_dirs, image_rays_in_cam = utils.get_plucker(K, Rt, H, W, return_image_plane=True)
+                    plucker_rays = utils.encode_plucker(ray_origins, ray_dirs)
+                    plucker_map = transforms.CenterCrop(res)(plucker_rays.reshape(H, W, -1).permute(2, 0, 1))
+                    # image_plane_in_cam = image_rays_in_cam.reshape(-1, H, W)
+                    image_plane_in_cam = transforms.CenterCrop(res)(image_rays_in_cam.reshape(-1, H, W))
+
+                    plucker_frames[i].append(plucker_map)
+                    # ray_dirs_preprocess = transforms.CenterCrop(self.size)(ray_dirs_unnormalized[:3, :].reshape(3, H, W)).permute(1, 2, 0).reshape(-1, 3)
+                    all_ray_origin.append(ray_origins[0][None, :])
+                    all_image_plane_in_cam.append(image_plane_in_cam)
+                    # all_ray_dirs_unnormalized.append(ray_dirs_preprocess)
+                    # all_cam_coords.append(cam_coords.T)
+                    all_rt.append(Rt)
+                    all_k.append(K)
+
+                    """
+                    if self.visualize:
+                        # depth_to_visualize = transforms.CenterCrop(self.size)(depth_to_visualize)
+                        depth_to_visualize = (depth_preprocessed / 2 + 0.5).clamp(0, 1)
+                        points_in_3d = utils.get_points_given_imageplane(image_plane_in_cam, depth_to_visualize, Rt, 100.0)
+                        all_points.append(points_in_3d.numpy().T)
+                        edges = np.arange(all_points[-1].shape[0]) + 1 + offset
+                        edges = np.hstack([np.zeros((all_points[-1].shape[0], 1)) + offset, edges[:, None]])
+                        all_edges.append(edges.astype(int))
+                        all_colors.append(np.zeros_like(all_points[-1]) + 19 * (i+1))
+                        offset += all_points[-1].shape[0]
+                    """
+
+                depth_frames.append(depth_preprocessed[None, ...])
+            else:
+                depth_frames.append(depth_preprocessed)
+
+        depth_video = torch.stack(depth_frames, axis=0)
+
+        if self.plucker_coords:
+            num_res = len(self.plucker_resolution)
+            plucker_video = []
+            for r in range(num_res):
+                video_per_res = torch.stack([plucker_frames[i][r] for i in range(self.num_images)], axis=0)
+                plucker_video.append(video_per_res)
+            # all_ray_origin = torch.stack(all_ray_origin, axis=0)
+            # all_image_plane_in_cam = torch.stack(all_image_plane_in_cam, axis=0)
+            all_rt = torch.stack(all_rt, axis=0)
+            # all_ray_dirs_unnormalized = torch.stack(all_ray_dirs_unnormalized, axis=0)
+            # all_cam_coords = torch.stack(all_cam_coords, axis=0)
+
+            # TODO will not work with the existing implementation of the pluckercoords
+            if self.spiral_poses:
+                middle_pose = np.zeros((1, 3, 5))
+                middle_K = all_k[6]
+                mp = torch.linalg.inv(all_rt[6])
+                middle_pose[0, :3, :4] = mp[:3, :4]
+                middle_pose[0, :, 4] = np.array([H, W, middle_K[0,0]])
+                render_poses = np.stack(utils.render_path_spiral(middle_pose, 3.0, N = 12))
+
+                # render poses should be of shape 12 x 3 x 5
+                # visualize them if the user wants to
+                if self.visualize:
+                    fig = plt.figure()
+                    ax = fig.add_subplot(projection='3d')
+                    for p in range(12):
+                        vis_c2w = render_poses[p][:4, :4]
+                        utils.draw_wireframe_camera(ax, vis_c2w, scale=1.0, color='g')
+                    for p in range(12):
+                        vis_c2w = torch.linalg.inv(all_rt[p])
+                        utils.draw_wireframe_camera(ax, vis_c2w.numpy(), scale=1.0, color='b')
+                    utils.draw_wireframe_camera(ax, mp.numpy(), scale=1.0, color='r')
+                    plt.show()
+
+                render_poses = torch.from_numpy(render_poses[:, :3, :4])
+                plucker_video = plucker_video.unsqueeze(0).repeat(12, 1, 1, 1, 1)
+                depth_video = depth_video.unsqueeze(0).repeat(12, 1, 1, 1, 1)
+                for p in range(12):
+                    pose = render_poses[p]
+                    pose_homo = torch.cat([pose, torch.Tensor([[0.0, 0.0, 0.0, 1.0]])], dim=0).float()
+                    render_ray_origins, render_ray_dirs = utils.get_plucker(middle_K, torch.linalg.inv(pose_homo), H, W)
+                    render_plucker_rays = utils.encode_plucker(render_ray_origins, render_ray_dirs)
+                    render_plucker_map = transforms.CenterCrop(self.plucker_resolution)(render_plucker_rays.reshape(H, W, -1).permute(2, 0, 1))
+                    plucker_video[p, 6, ...] = render_plucker_map
+
+        """
+        if self.visualize:
+            all_points = np.concatenate(all_points, axis=0)
+            all_edges = np.concatenate(all_edges, axis=0)
+            all_colors = np.concatenate(all_colors, axis=0)
+            utils.write_pointcloud(f"/data/tkhurana/visualizations/plucker/{ref_index}.ply", all_points, rgb_points=all_colors)
+        """
+
+        if self.shuffle_video:
+            random_indices = torch.randperm(self.num_images)
+            depth_video = depth_video[random_indices]
+            if self.plucker_coords:
+                plucker_video = [pv[random_indices] for pv in plucker_video]
+
+        example["input"] = depth_video  # video is of shape T x H x W or T x C x H x W
+        example["filenames"] = all_filenames
+        if self.plucker_coords:
+            example["plucker_coords"] = plucker_video
+            # example["ray_origin"] = all_ray_origin
+            # example["image_plane_in_cam"] = all_image_plane_in_cam
+            example["Rt"] = all_rt
+            # example["ray_direction"] = all_ray_dirs_unnormalized
+            # example["cam_coords"] = all_cam_coords
+        return example
+
+
+class DebugDataset(Dataset):
+    """
+    A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
+    It pre-processes the images and the tokenizes prompts.
+    """
+
+    def __init__(
+        self,
+        instance_data_root,
+        size=256,
+        num_images=3,
+        offset=15,
+        split="train",
+        ext=["png"],
+        center_crop=True,
+        normalization_factor=20480.0,
+        visualize=False,
+    ):
+        self.size = size
+        self.offset = offset
+        self.center_crop = center_crop
+        self.num_images = num_images
+        self.split = split
+        self.visualize = visualize
+        self.normalization_factor = normalization_factor
+        self.sequence = num_images > 1
+
+        self.instance_data_root = Path(instance_data_root)
+        if not self.instance_data_root.exists():
+            raise ValueError(f"Instance {self.instance_data_root} images root doesn't exists.")
+
+        # NOTE:
+        self.sequences = []
+        self.filenames = []
+        self.valid_indices = []
+        all_frames = []
+        seq_to_frames = {}
+        self.seq_to_startend = {}
+
+        if "pointodyssey" in str(self.instance_data_root):
+            for e in ext:
+                all_frames.extend(sorted(list(self.instance_data_root.rglob(f"*/depths/depth_*.{e}"))))
+        else:
+            for e in ext:
+                all_frames.extend(sorted(list(self.instance_data_root.rglob(f"*.{e}"))))
+
+        all_frames = list(all_frames)
+
+        self.paths = all_frames
+
+        if self.sequence:
+            for frame in all_frames:
+                seq = str(frame)[len(str(self.instance_data_root)) + 1:str(frame).rfind("/")]
+                if seq not in seq_to_frames:
+                    seq_to_frames[seq] = []
+                seq_to_frames[seq].append(frame)
+
+            for seq in seq_to_frames:
+                frames = seq_to_frames[seq]
+                start_index = len(self.filenames)
+
+                for idx in range(0, len(frames), self.offset):
+                    frame_path = frames[idx]
+                    self.sequences.append(seq)
+                    self.filenames.append(frame_path)
+
+                #
+                end_index = len(self.filenames)
+                #
+                valid_start_index = start_index
+                valid_end_index = end_index - self.num_images
+                self.seq_to_startend[seq] = (valid_start_index, valid_end_index)
+                self.valid_indices += list(range(valid_start_index, valid_end_index))
+        self.num_instance_images = len(self.valid_indices)
+        self._length = self.num_instance_images
+
+        print("found length to be", self._length)
+
+        self.image_transforms = transforms.Compose(
+            [
+                transforms.Resize(size, interpolation=transforms.InterpolationMode.NEAREST),
+                transforms.CenterCrop(size),
+                transforms.ToTensor(),
+                # brings the training data between -1 and 1
+                transforms.Normalize([0.5], [0.5]),
+            ]
+        )
+
+    def __len__(self):
+        return self._length
+
+    def __getitem__(self, index):
+        example = {}
+        ref_index = self.valid_indices[index]
+        ref_seq = self.sequences[ref_index]
+        start = self.seq_to_startend[ref_seq][0]
+        end = self.seq_to_startend[ref_seq][1]
+        if ref_index + 1 == min(end, ref_index + 20):
+            future_index = np.array([ref_index])
+        else:
+            future_index = np.random.choice(np.arange(ref_index + 1, min(end, ref_index + 20)), size=(1,), replace=False)
+        depth_frames = []
+        all_filenames = []
+        index_labels = []
+
+        for i in list(range(self.num_images)) + [future_index[0]]:
+            if i < self.num_images:
+                query_index = int(ref_index + i)
+            else:
+                query_index = int(i)
+
+            all_filenames.append(self.filenames[query_index])
+
+            curr_seq = self.sequences[query_index]
+            assert ref_seq == curr_seq
+
+            depth = cv2.imread(str(self.filenames[query_index]), cv2.IMREAD_ANYDEPTH)
+            depth = depth.astype(np.float32) / self.normalization_factor
+
+            if "pointodyssey" in str(self.filenames[query_index]):
+                depth = np.where(depth > 100.0, 100.0, depth)
+                depth = depth / 100.0
+                depth_clipped = np.clip(depth, 0, 1)
+                depth = depth_clipped * 255.0
+            else:
+                # in TAO, we predicted per frame relative depth
+                depth = (depth - depth.min()) / (depth.max() - depth.min()) * 255.0
+
+            depth_preprocessed = self.image_transforms(Image.fromarray(depth.astype("uint8"))).squeeze()
+            depth_frames.append(depth_preprocessed)
+
+            if i < self.num_images:
+                index_label = torch.Tensor([i - self.num_images + 1])
+            else:
+                index_label = torch.Tensor([i - ref_index])
+
+            index_labels.append(index_label)
+
+        depth_video = torch.stack(depth_frames, axis=0)
+        label_video = torch.stack(index_labels, axis=0)
+
+        example["input"] = depth_video  # video is of shape T x H x W or T x C x H x W
+        example["filenames"] = all_filenames
+        example["plucker_coords"] = label_video
+
+        return example
+

@@ -8,11 +8,11 @@ import numpy as np
 from PIL import Image
 from torchvision import transforms
 from diffusers import DDPMPipeline, DDPMDepthPoseInpaintingPipeline, DDPMInpaintingPipeline, DDPMReconstructionPipeline
-from diffusers import DPMSolverMultistepScheduler, UNet2DModel, UNet2DRenderModel, DDPMScheduler, DDPMConditioningScheduler
+from diffusers import DPMSolverMultistepScheduler, UNet2DModel, UNet2DConditionRenderModel, DDPMScheduler, DDPMConditioningScheduler
 import matplotlib.cm
 
 import utils
-from data import OccfusionDataset, collate_fn_depthpose, collate_fn_inpainting
+from data import DebugDataset, OccfusionDataset, collate_fn_depthpose, collate_fn_inpainting
 from utils import render_path_spiral, write_pointcloud
 
 
@@ -157,6 +157,14 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--use_harmonic",
+        default=False,
+        action="store_true",
+        help=(
+            "Whether to use rendering at the end of the network"
+        ),
+    )
+    parser.add_argument(
         "--random_flip",
         default=False,
         action="store_true",
@@ -200,6 +208,7 @@ def parse_args():
         help="Whether the model should predict the 'epsilon'/noise error or directly the reconstructed image 'x0'.",
     )
     parser.add_argument("--ddpm_num_steps", type=int, default=1000)
+    parser.add_argument("--shuffle_video", action="store_true")
     parser.add_argument("--ddpm_num_inference_steps", type=int, default=1000)
     parser.add_argument("--num_inference_steps", type=int, default=40)
     parser.add_argument("--ddpm_beta_schedule", type=str, default="linear")
@@ -219,13 +228,14 @@ def main(args):
     Scheduler = DDPMScheduler  # DDPMConditioningScheduler
     if args.use_rendering:
         assert args.train_with_plucker_coords
-        assert args.prediction_type == "sample"
-        UNetModel = UNet2DRenderModel
+        # assert args.prediction_type == "sample"
+        UNetModel = UNet2DConditionRenderModel
     else:
         UNetModel = UNet2DModel
     unet = UNetModel.from_pretrained(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/unet")
     unet = unet.to("cuda:0")
 
+    """
     dataset = OccfusionDataset(
         instance_data_root=args.eval_data_dir,
         size=args.resolution,
@@ -234,9 +244,23 @@ def main(args):
         offset=args.offset,
         normalization_factor=args.normalization_factor,
         plucker_coords=args.train_with_plucker_coords,
-        use_harmonic=False,
+        plucker_resolution=[64, 32, 16] if args.use_rendering else [64],
+        shuffle_video=args.shuffle_video,
+        use_harmonic=args.use_harmonic,
         visualize=True,
         spiral_poses=args.visualize_spiral,
+    )
+    """
+
+    dataset = DebugDataset(
+        instance_data_root=args.eval_data_dir,
+        size=args.resolution,
+        center_crop=args.center_crop,
+        num_images=args.num_images,
+        offset=args.offset,
+        split="val",
+        normalization_factor=args.normalization_factor,
+        visualize=False
     )
 
     assert args.eval_batch_size == 1, "eval batch size must be 1"
@@ -265,10 +289,6 @@ def main(args):
         )
     else:
         noise_scheduler = Scheduler(num_train_timesteps=1000, beta_schedule="linear")
-
-    if args.use_rendering:
-        assert args.train_with_plucker_coords
-        assert args.prediction_type == "sample"
 
     # noise_scheduler = DPMSolverMultistepScheduler(num_train_timesteps=1000, beta_schedule="linear")
     if args.model_type == "reconstruction":
@@ -302,28 +322,38 @@ def main(args):
         #     continue
 
         data_point = batch["input"].to("cuda:0")
+
         if args.train_with_plucker_coords:
-            ray_origin = batch["ray_origin"]
+            plucker = batch["plucker_coords"].to("cuda:0")
+            print("found frame idS to be", plucker * 70)
+            # plucker = [pc.to("cuda:0") for pc in batch["plucker_coords"]]
+            # ray_origin = batch["ray_origin"]
             # ray_direction = batch["ray_direction"]
             # cam_coords = batch["cam_coords"]
 
         total_frames = data_point.shape[1]
         past_frames = torch.stack([data_point[0, :int(total_frames / 2), ...]] * 1)
         future_frames = torch.stack([data_point[0, int(total_frames / 2):, ...]] * 1)
+        data_point = torch.stack([data_point[0, ...]] * 4)
+        plucker = torch.stack([plucker[0, ...]] * 4)
+        print(plucker[:, 3:4, :].shape, torch.arange(4)[None, :, None].to("cuda:0").shape)
+        plucker = plucker[:, 3:4, :] + torch.arange(4)[None, :, None].to("cuda:0")
+        batch_size = 4
+        print("data point and plucker shape", data_point.shape, plucker.shape)
 
         if args.visualize_spiral:
             assert data_point.shape[0] == 1, "only works for batch size 1"
             assert args.masking_strategy == "random", "only works for random masking strategy"
             # we always only visualize the 6th timestep in a spiral
-            time_indices = [6]
+            time_indices = torch.Tensor([6]).int()
             args.num_masks = 1
             batch_size = 12
+            print(data_point.shape, plucker.shape)
             data_point = data_point[0]
-            print(data_point[0, 6, 1, 0, :], data_point[1, 6, 1, 0, :])
+            plucker = plucker[0]
         else:
-            time_indices = None # [0,1,2,3,4,5,7,8,9,10,11]
-            args.num_masks = None # 11
-            batch_size = 1
+            time_indices = torch.Tensor([3]).int() # [0,1,2,3,4,5,7,8,9,10,11]
+            args.num_masks = 1 # 11
 
         if args.model_type == "reconstruction":
             prediction = pipeline(
@@ -345,7 +375,7 @@ def main(args):
         elif args.model_type == "depthpose":
             print("getting predictions using args.num_masks", args.num_masks)
             prediction, unmasked_indices = pipeline(
-                    inpainting_image=data_point,
+                    inpainting_image=(data_point, plucker),
                     batch_size=batch_size,
                     num_inference_steps=args.num_inference_steps,
                     output_type="numpy",
@@ -357,17 +387,18 @@ def main(args):
         prediction = torch.from_numpy(prediction).permute(0, 3, 1, 2)
         B, T, H, W = prediction.shape
 
-        colored_images = []
-
         if args.visualize_3d:
             all_points = []
             all_colors = []
             all_edges = []
             i = 0
 
+        batch_colored_images = {0: [], 1: [], 2: [], 3: []}
+
         for b in range(prediction.shape[0]):
             count += 1
             spiral = []
+            colored_images = []
             for framenumber in range(prediction.shape[1]):
                 prediction_minmax = (prediction[b, framenumber] - prediction[b, framenumber].min()) / (prediction[b, framenumber].max() - prediction[b, framenumber].min())
                 if framenumber in masked_indices:
@@ -376,6 +407,7 @@ def main(args):
                     cmap = matplotlib.cm.get_cmap('gray')
                 colored_image = cmap(prediction_minmax)
                 colored_images.append(Image.fromarray((colored_image * 255).astype(np.uint8)))
+                batch_colored_images[b].append(Image.fromarray((colored_image * 255).astype(np.uint8)))
 
                 if args.visualize_3d:
                     ro = ray_origin[b, framenumber, ...].numpy().reshape(1, 3)
@@ -425,14 +457,29 @@ def main(args):
                 all_points = np.concatenate(all_points, axis=0)
                 all_colors = np.concatenate(all_colors, axis=0)
                 all_edges = np.stack(all_edges, axis=0)
-                write_pointcloud(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals/3d_{count}.ply", all_points, all_colors, edges=all_edges)
+                write_pointcloud(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals_debug/3d_{count}.ply", all_points, all_colors, edges=all_edges)
 
-            os.makedirs(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals", exist_ok=True)
-            utils.make_gif(colored_images, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals/2d_{count}.gif", duration=800)
+            os.makedirs(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals_debug", exist_ok=True)
+            utils.make_gif(colored_images, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals_debug/2d_{count}.gif", duration=800)
+
+        batch_colored_images_toplot = []
+        widths, heights = zip(*(i.size for i in batch_colored_images[0]))
+        total_width = sum(widths)
+        max_height = max(heights)
+
+        for i in range(len(batch_colored_images[0])):
+            x_offset = 0
+            new_im = Image.new('RGB', (total_width, max_height))
+            for b in range(prediction.shape[0]):
+                new_im.paste(batch_colored_images[b][i], (x_offset,0))
+                x_offset += batch_colored_images[b][i].size[0]
+            batch_colored_images_toplot.append(new_im)
+
+        utils.make_gif(batch_colored_images_toplot, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals_debug/batch_2d_{count}.gif", duration=800)
 
         if args.visualize_spiral:
             spiral.append(colored_images[6])
-            utils.make_gif(spiral, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals/spiral_{count}.gif", duration=800)
+            utils.make_gif(spiral, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals_debug/spiral_{count}.gif", duration=800)
 
 
 if __name__ == "__main__":

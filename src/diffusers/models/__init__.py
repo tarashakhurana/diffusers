@@ -32,6 +32,7 @@ if is_torch_available():
     from .unet_4d_voxel import UNet4DVoxelModel
     from .unet_static3d_voxel import UNetStatic3DVoxelModel
     from .unet_2d_condition import UNet2DConditionModel
+    from .unet_2d_condition_render import UNet2DConditionRenderModel
     from .unet_3d_condition import UNet3DConditionModel
     from .vq_model import VQModel
 

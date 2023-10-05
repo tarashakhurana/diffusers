@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, List
 
 import torch
 import torch.nn as nn
 
+from matplotlib import pyplot as plt
 from ..configuration_utils import ConfigMixin, register_to_config
 from ..utils import BaseOutput
 from .embeddings import GaussianFourierProjection, TimestepEmbedding, Timesteps
@@ -115,7 +116,7 @@ class UNet2DRenderModel(ModelMixin, ConfigMixin):
         mlp_hidden_dim: int = 128,
         num_attention_heads: int = 8,
         final_attention_head_dim: int = 64,
-        query_channels: int = 72,
+        query_channels: int = 6,
         render_out_channels: int = 12,
         attention_dropout: float = 0.0,
         attention_bias: bool = False,
@@ -125,6 +126,7 @@ class UNet2DRenderModel(ModelMixin, ConfigMixin):
         super().__init__()
 
         self.sample_size = sample_size
+        self.render_out_channels = render_out_channels
         time_embed_dim = block_out_channels[0] * 4
 
         # Check inputs
@@ -239,23 +241,26 @@ class UNet2DRenderModel(ModelMixin, ConfigMixin):
         # render
         self.render_by_attention = get_rendering_transformer_block(
             query_channels,
-            render_out_channels,
+            64,
             mlp_hidden_dim=mlp_hidden_dim,
             num_attention_heads=num_attention_heads,
             attention_head_dim=final_attention_head_dim,
             dropout=attention_dropout,
             residual_connection=residual_connection,
-            cross_attention_dim=out_channels,
+            cross_attention_dim=70,
             cross_attention_norm=cross_attention_norm,
             attention_bias=attention_bias,
             upcast_attention=upcast_attention,
             norm_elementwise_affine=norm_elementwise_affine
         )
 
+
     def forward(
         self,
         sample: torch.FloatTensor,
         query_rays: torch.FloatTensor,
+        query_indices: Union[List, torch.Tensor],
+        keyvalue_indices: Union[List, torch.Tensor],
         timestep: Union[torch.Tensor, float, int],
         class_labels: Optional[torch.Tensor] = None,
         return_dict: bool = True,
@@ -328,6 +333,32 @@ class UNet2DRenderModel(ModelMixin, ConfigMixin):
         # 4. mid
         sample = self.mid_block(sample, emb)
 
+        # 4.5. render with poses in the latent space
+        # sample is going to be of shape B X 12c X H X W
+        # query_rays is going to be of shape B X 72 X H X W
+        B, _, H, W = sample.shape
+        sample_t = sample.reshape(B, self.render_out_channels, -1, H, W)
+        query_rays_t = query_rays.reshape(B, self.render_out_channels, -1, H, W)
+
+        sample_hwt = sample_t.permute(0, 2, 3, 4, 1).reshape(B, -1, H*W, self.render_out_channels)
+        query_rays_hwt = query_rays_t.permute(0, 2, 3, 4, 1).reshape(B, -1, H*W, self.render_out_channels)
+        sample_kv_hwt = torch.cat([sample_hwt, query_rays_hwt], dim=1)
+
+        query_rays_hwt_sliced = query_rays_hwt[..., query_indices]
+        sample_kv_hwt_sliced = sample_kv_hwt[..., keyvalue_indices]
+        sample_hwt_sliced = self.render_by_attention(query_rays_hwt_sliced, sample_kv_hwt_sliced)
+
+        # print("torch unique for values in attention output", torch.unique(sample_hwt_sliced))
+        # if sample_hwt_sliced.grad is not None:
+        #     print("torch unique for grad", torch.unique(sample_hwt_sliced.grad))
+
+        sample_hwt[..., query_indices] = sample_hwt_sliced
+        # print("torch unique for values in final output", torch.unique(sample_hwt))
+        # if sample_hwt.grad is not None:
+        #     print("torch unique for grad in final output", torch.unique(sample_hwt.grad))
+
+        sample = sample_hwt.permute(0, 3, 1, 2).reshape(B, -1, H*W).reshape(B, -1, H, W)
+
         # 5. up
         skip_sample = None
         for upsample_block in self.up_blocks:
@@ -339,10 +370,13 @@ class UNet2DRenderModel(ModelMixin, ConfigMixin):
             else:
                 sample = upsample_block(sample, res_samples, emb)
 
-        # 6. post-process
+        # 6. get output
         sample = self.conv_norm_out(sample)
         sample = self.conv_act(sample)
         sample = self.conv_out(sample)
+
+        # for i in range(sample.shape[1]):
+        #     plt.imsave(f"/data3/tkhurana/diffusers/logs/output_from_unet_{i}.png", sample[0, i, :, :].cpu().numpy())
 
         if skip_sample is not None:
             sample += skip_sample
@@ -353,9 +387,5 @@ class UNet2DRenderModel(ModelMixin, ConfigMixin):
 
         if not return_dict:
             return (sample,)
-
-        # sample is going to be of shape B X H X W X C
-        # query_rays is going to be of shape B X H X W X 6
-        sample = self.render_by_attention(query_rays, sample)
 
         return UNet2DOutput(sample=sample)
