@@ -36,7 +36,7 @@ from diffusers.utils.import_utils import is_xformers_available
 
 import utils
 from utils import HarmonicEmbedding, write_pointcloud
-from data import DebugDataset, OccfusionDataset, collate_fn_depthpose, collate_fn_inpainting
+from data import DebugDataset, TAOTemporalSuperResolutionDataset, OccfusionDataset, collate_fn_depthpose, collate_fn_inpainting, collate_fn_temporalsuperres
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.16.0.dev0")
@@ -615,7 +615,6 @@ def main(args):
         use_harmonic=args.use_harmonic,
         visualize=args.visualize_dataloader
     )
-    """
 
     dataset = DebugDataset(
         instance_data_root=args.train_data_dir,
@@ -627,15 +626,28 @@ def main(args):
         normalization_factor=args.normalization_factor,
         visualize=args.visualize_dataloader
     )
+    """
+
+    dataset = TAOTemporalSuperResolutionDataset(
+        instance_data_root=args.train_data_dir,
+        size=args.resolution,
+        center_crop=args.center_crop,
+        num_images=args.num_images,
+        batch_size=args.train_batch_size,
+        split="train",
+        normalization_factor=args.normalization_factor,
+        visualize=args.visualize_dataloader
+    )
 
     if args.train_with_plucker_coords:
-        collate_fn = collate_fn_depthpose
+        # collate_fn = collate_fn_depthpose
+        collate_fn = collate_fn_temporalsuperres
     else:
         collate_fn = collate_fn_inpainting
 
     train_dataloader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=args.train_batch_size,
+        batch_size=1,
         shuffle=True,
         collate_fn=collate_fn,
         num_workers=args.dataloader_num_workers,
