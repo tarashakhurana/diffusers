@@ -1148,13 +1148,14 @@ class TAOTemporalSuperResolutionDataset(Dataset):
         end = ref_index
         batch_depthframes = []
         batch_filenames = []
-        batch_indexlabels = []
+        batch_labels = []
+        batch_indices = []
 
         # prepare the input conditioning frames
         num_input = np.random.randint(1, self.num_images)
         input_depthframes = []
         input_filenames = []
-        input_indexlabels = []
+        input_labels = []
         input_indices = np.random.choice(
                 np.arange(start, end),
                 size=(num_input,),
@@ -1179,7 +1180,7 @@ class TAOTemporalSuperResolutionDataset(Dataset):
 
             depth_preprocessed = self.image_transforms(Image.fromarray(depth.astype("uint8"))).squeeze()
             input_depthframes.append(depth_preprocessed)
-            input_indexlabels.append([int(query_index)])
+            input_labels.append([int(query_index)])
 
 
         # prepare the output conditioning frames
@@ -1192,7 +1193,7 @@ class TAOTemporalSuperResolutionDataset(Dataset):
                     replace=False)
             output_depthframes = []
             output_filenames = []
-            output_indexlabels = []
+            output_labels = []
 
             for query_index in output_indices:
                 output_filenames.append(self.filenames[query_index])
@@ -1213,34 +1214,64 @@ class TAOTemporalSuperResolutionDataset(Dataset):
 
                 depth_preprocessed = self.image_transforms(Image.fromarray(depth.astype("uint8"))).squeeze()
                 output_depthframes.append(depth_preprocessed)
-                output_indexlabels.append([int(query_index)])
+                output_labels.append([int(query_index)])
 
             # TODO: post process
             # 1. sort the input+output arrays
             # 2. choose an anchor which will always appear at t=0 to the network
             combined_depthframes = torch.stack(input_depthframes + output_depthframes, axis=0)
-            combined_indexlabels = torch.Tensor(input_indexlabels + output_indexlabels)
+            combined_labels = torch.Tensor(input_labels + output_labels)
             combined_filenames = np.array(input_filenames + output_filenames)
 
-            indices = torch.argsort(combined_indexlabels, dim=0)[:, 0]
+            indices = torch.argsort(combined_labels, dim=0)[:, 0]
             combined_depthframes = combined_depthframes[indices]
             combined_filenames = combined_filenames[indices]
-            combined_indexlabels = combined_indexlabels[indices]
+            combined_labels = combined_labels[indices]
+            combined_indices = [int(f) in output_indices for f in combined_labels]
 
-            combined_indexlabels = combined_indexlabels - ref_index
+            combined_labels = (combined_labels - ref_index) / self.fps
 
             batch_depthframes.append(combined_depthframes)
             batch_filenames.append(combined_filenames)
-            batch_indexlabels.append(combined_indexlabels)
+            batch_labels.append(combined_labels)
+            batch_indices.append(torch.Tensor(combined_indices))
 
         depth_video = torch.stack(batch_depthframes, axis=0)
-        label_video = torch.stack(batch_indexlabels, axis=0)
+        label_video = torch.stack(batch_labels, axis=0)
+        index_video = torch.stack(batch_indices, axis=0)
+
+        if self.visualize:
+            for i in range(self.batch_size):
+                fig = plt.figure()
+                for j in range(self.num_images):
+                    plt.subplot(1, self.num_images, j+1)
+                    print("depth video shape", depth_video.shape, depth_video[i, j].shape)
+                    if not index_video[i, j]:
+                        plt.imshow(depth_video[i, j].numpy(), cmap="gray")
+                    else:
+                        plt.imshow(depth_video[i, j].numpy())
+                    plt.title(str(label_video[i, j]) + "\n" + str(index_video[i, j]))
+                plt.show()
 
         example["input"] = depth_video  # video is of shape B x T x H x W
         example["filenames"] = batch_filenames
         example["plucker_coords"] = label_video
+        example["indices"] = index_video
 
         return example
 
 
+if __name__ == "__main__":
+    dataset = TAOTemporalSuperResolutionDataset(
+        instance_data_root="../../../TAO-depth/frames/test/",
+        size=64,
+        center_crop=False,
+        num_images=12,
+        batch_size=4,
+        split="train",
+        normalization_factor=20480.0,
+        visualize=True
+    )
+    for i in range(len(dataset)):
+        print(dataset[i])
 
