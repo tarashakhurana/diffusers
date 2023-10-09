@@ -397,7 +397,7 @@ def main(args):
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.logger,
-        logging_dir=logging_dir,
+        project_dir=logging_dir,
         project_config=accelerator_project_config,
         # kwargs_handlers=[ddp_kwargs]
     )
@@ -516,7 +516,7 @@ def main(args):
                 up_block_types=up_block_types,
             )
         else:
-            st = torch.load("diffusion_pytorch_model.bin")
+            # st = torch.load("diffusion_pytorch_model.bin")
             model = UNetModel(
                 sample_size=args.resolution,
                 in_channels=args.in_channels,
@@ -534,6 +534,7 @@ def main(args):
                 norm_eps=1e-05,
                 norm_num_groups=32
             )
+            """
             for name, params in model.named_parameters():
                 if name in st:
                     if 'attn2' in name:
@@ -541,6 +542,7 @@ def main(args):
                     else:
                         params.data = st[f'{name}']
                         # params.requires_grad = False
+            """
     else:
         config = UNetModel.load_config(args.model_config_name_or_path)
         model = UNetModel.from_config(config)
@@ -581,8 +583,14 @@ def main(args):
             beta_schedule=args.ddpm_beta_schedule,
             prediction_type=args.prediction_type,
         )
+        visualization_scheduler = DDPMScheduler(
+            num_train_timesteps=args.ddpm_num_steps,
+            beta_schedule=args.ddpm_beta_schedule,
+            prediction_type=args.prediction_type,
+        )
     else:
         noise_scheduler = DDPMScheduler(num_train_timesteps=args.ddpm_num_steps, beta_schedule=args.ddpm_beta_schedule)
+        visualization_scheduler = DDPMScheduler(num_train_timesteps=args.ddpm_num_steps, beta_schedule=args.ddpm_beta_schedule)
 
     # Initialize the optimizer
     optimizer = torch.optim.AdamW(
@@ -731,6 +739,7 @@ def main(args):
             if "indices" in batch:
                 masking_strategy = "custom"
                 time_indices = batch["indices"].flatten().int()
+                time_indices = torch.where(time_indices == 1)[0]
 
             B, T, C, H, W = clean_images.shape
             clean_depths = clean_images[:, :, 0, :, :]
@@ -811,9 +820,6 @@ def main(args):
                     clean_images_masked,
                     mask_images.reshape(B, T, H, W)], dim=1)
 
-                print(clean_images.shape, "5", rendering_poses.shape, time_indices.shape, torch.sum(time_indices), clean_depths_masked.shape, clean_images_masked.shape)
-                print(model_inputs.shape)
-
             if args.use_rendering:
                 inputoutput_indices = time_indices.clone()
 
@@ -831,7 +837,6 @@ def main(args):
                     model_output = model(model_inputs, timesteps).sample
 
                 if args.loss_only_on_masked:
-                    print("model output shape", model_output.shape, time_indices.shape, noise.shape)
                     loss_indices = time_indices
                     model_output = model_output.reshape(B*T, H, W)
                     noise = noise.reshape(B*T, H, W)
@@ -855,6 +860,23 @@ def main(args):
                         raise ValueError(f"Unsupported prediction type: {args.prediction_type}")
                 else:
                     loss_2d = 0.0
+
+                # visualize the model inputs and outputs in a matplotlib subplot
+                # of shape 4 x 12. first three rows show noisy_depth, masked_depth, and mask
+                # last row shows the model output
+                if False:
+                    model_output = model_output.reshape(B, T, H, W)
+                    for b in range(B):
+                        batch_model_output = visualization_scheduler.step(model_output[b:b+1], timesteps[b].cpu(), noisy_depths[b:b+1]).pred_original_sample  # , generator=generator).prev_sample
+                        print("about to start visualization", batch_model_output.shape, model_output[b:b+1].shape, noisy_depths[b:b+1].shape)
+                        fig, axs = plt.subplots(4, 12, figsize=(12, 4))
+                        for i in range(12):
+                            axs[0, i].imshow(model_inputs[b, 0 * 12 + i, ...].cpu().numpy())
+                            axs[1, i].imshow(model_inputs[b, 1 * 12 + i, ...].cpu().numpy())
+                            axs[2, i].imshow(model_inputs[b, 2 * 12 + i, ...].cpu().numpy() * 10)
+                            axs[3, i].imshow(batch_model_output[0, i, ...].cpu().detach().numpy())
+
+                        plt.show()
 
                 loss = loss_2d
                 accelerator.backward(loss)
