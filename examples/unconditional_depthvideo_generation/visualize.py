@@ -12,7 +12,7 @@ from diffusers import DPMSolverMultistepScheduler, UNet2DModel, UNet2DConditionR
 import matplotlib.cm
 
 import utils
-from data import DebugDataset, OccfusionDataset, collate_fn_depthpose, collate_fn_inpainting
+from data import DebugDataset, OccfusionDataset, collate_fn_depthpose, collate_fn_inpainting, TAOTemporalSuperResolutionDataset, collate_fn_temporalsuperres
 from utils import render_path_spiral, write_pointcloud
 
 
@@ -198,7 +198,7 @@ def parse_args():
         "--masking_strategy",
         type=str,
         default="random",
-        choices=["all", "none", "random", "random-half", "half"],
+        choices=["all", "none", "random", "random-half", "half", "custom"],
     )
     parser.add_argument(
         "--model_type",
@@ -251,7 +251,6 @@ def main(args):
         spiral_poses=args.visualize_spiral,
     )
     """
-
     dataset = DebugDataset(
         instance_data_root=args.eval_data_dir,
         size=args.resolution,
@@ -262,6 +261,18 @@ def main(args):
         normalization_factor=args.normalization_factor,
         visualize=False
     )
+    """
+    dataset = TAOTemporalSuperResolutionDataset(
+        instance_data_root=args.eval_data_dir,
+        size=args.resolution,
+        center_crop=args.center_crop,
+        num_images=args.num_images,
+        batch_size=args.eval_batch_size,
+        split="train",
+        normalization_factor=args.normalization_factor,
+        visualize=False
+    )
+    """
 
     assert args.eval_batch_size == 1, "eval batch size must be 1"
 
@@ -325,7 +336,7 @@ def main(args):
 
         if args.train_with_plucker_coords:
             plucker = batch["plucker_coords"].to("cuda:0")
-            print("found frame idS to be", plucker * 70)
+            # print("found frame idS to be", data_point.shape, plucker.shape)
             # plucker = [pc.to("cuda:0") for pc in batch["plucker_coords"]]
             # ray_origin = batch["ray_origin"]
             # ray_direction = batch["ray_direction"]
@@ -334,11 +345,11 @@ def main(args):
         total_frames = data_point.shape[1]
         past_frames = torch.stack([data_point[0, :int(total_frames / 2), ...]] * 1)
         future_frames = torch.stack([data_point[0, int(total_frames / 2):, ...]] * 1)
-        data_point = torch.stack([data_point[0, ...]] * 4)
-        plucker = torch.stack([plucker[0, ...]] * 4)
-        print(plucker[:, 3:4, :].shape, torch.arange(4)[None, :, None].to("cuda:0").shape)
-        plucker = plucker[:, 3:4, :] + torch.arange(4)[None, :, None].to("cuda:0")
-        batch_size = 4
+        # data_point = torch.stack([data_point[0, ...]] * 4)
+        # plucker = torch.stack([plucker[0, ...]] * 4)
+        # print(plucker.shape, plucker[:, 6:7, :].shape, ((torch.arange(4)[:, None, None].to("cuda:0") / 3) *  (plucker[:, 6:7, :] - plucker[:, 5:6, :])).shape)
+        # plucker[:, 6:7, :] = plucker[:, 6:7, :] + (torch.arange(4)[:, None, None].to("cuda:0") / 3) *  (plucker[:, 6:7, :] - plucker[:, 5:6, :])
+        # batch_size = 4
         print("data point and plucker shape", data_point.shape, plucker.shape)
 
         if args.visualize_spiral:
@@ -352,8 +363,9 @@ def main(args):
             data_point = data_point[0]
             plucker = plucker[0]
         else:
-            time_indices = torch.Tensor([3]).int() # [0,1,2,3,4,5,7,8,9,10,11]
-            args.num_masks = 1 # 11
+            time_indices = torch.Tensor([3]).int()  # [0,1,2,3,4,5,7,8,9,10,11]
+            args.num_masks = 1  # 11
+            batch_size = 1
 
         if args.model_type == "reconstruction":
             prediction = pipeline(
@@ -464,7 +476,7 @@ def main(args):
 
         batch_colored_images_toplot = []
         widths, heights = zip(*(i.size for i in batch_colored_images[0]))
-        total_width = sum(widths)
+        total_width = sum(widths[:4])
         max_height = max(heights)
 
         for i in range(len(batch_colored_images[0])):

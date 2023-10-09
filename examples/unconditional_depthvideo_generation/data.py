@@ -282,12 +282,17 @@ def collate_fn_temporalsuperres(examples):
     plucker_coords = plucker_coords.to(memory_format=torch.contiguous_format).float()
     plucker_coords = plucker_coords.squeeze(0)
 
+    indices = torch.stack([example["indices"] for example in examples])
+    indices = indices.to(memory_format=torch.contiguous_format).float()
+    indices = indices.squeeze(0)
+
     filenames = [example["filenames"] for example in examples][0]
 
     return {
         "input": inputs,
         "plucker_coords": plucker_coords,
-        "filenames": filenames
+        "filenames": filenames,
+        "indices": indices
     }
 
 

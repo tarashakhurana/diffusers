@@ -93,7 +93,7 @@ class DDPMDepthPoseInpaintingPipeline(DiffusionPipeline):
             else:
                 image_shape = (
                     batch_size,
-                    4,
+                    12,
                     self.unet.config.sample_size,
                     self.unet.config.sample_size,
                 )
@@ -114,7 +114,6 @@ class DDPMDepthPoseInpaintingPipeline(DiffusionPipeline):
         # set step values
         self.scheduler.set_timesteps(num_inference_steps)
 
-        # 0. prepare the model inputs
         # if plucker coords == True then the inpainting image is a 5D tensor
         # with the third dimension containing the plucker coords + depth map
         # otherwise the inpainting image is a 4D tensor with the second dimension
@@ -128,31 +127,14 @@ class DDPMDepthPoseInpaintingPipeline(DiffusionPipeline):
             assert self.train_with_plucker_coords
             rendering_poses = inpainting_image[1]
             clean_images = clean_images[:, :, None, :, :]
+            print("shapes", clean_images.shape, rendering_poses.shape)
 
         B, T, C, H, W = clean_images.shape
         clean_depths = clean_images[:, :, 0, :, :]
 
-        if self.train_with_plucker_coords:
-            if self.use_rendering:
-                noisy_images = image
-            else:
-                noisy_images = torch.cat([image[:, :, None, :, :], clean_images[:, :, 1:, :, :]], dim=2)
-        else:
-            noisy_images = image
-
         # choose the type of masking strategy
         # remember that both the clean and noisy images are 5D tensors now
-        if self.masking_strategy == "none":
-            # merge the timesteps and height dimension of all voxel grids
-            model_inputs = torch.cat([
-                noisy_images.reshape(B, T*C, H, W),
-                clean_images.reshape(B, T*C, H, W)], dim=1)
-
-        elif self.masking_strategy == "all":
-            # merge the timesteps and height dimension of all voxel grids
-            model_inputs = noisy_images.reshape(B, T*C, H, W)
-
-        elif self.masking_strategy == "random" or self.masking_strategy == "random-half" or self.masking_strategy == "half":
+        if self.masking_strategy == "random" or self.masking_strategy == "random-half" or self.masking_strategy == "half":
             # first pick a random number of frames to mask
             # then pick above number of frame IDs to mask
             num_masks = torch.randint(0, self.n_input + self.n_output - 1, (1,)) + 1
@@ -168,27 +150,50 @@ class DDPMDepthPoseInpaintingPipeline(DiffusionPipeline):
                 time_indices = torch.arange(self.n_input, self.n_input + self.n_output, 1)
             if user_time_indices is not None:
                 time_indices = user_time_indices
-            time_indices_unmasked = torch.Tensor([i for i in range(self.n_output + self.n_input) if i not in time_indices])
-            mask_images = torch.zeros_like(clean_images[:, :, 0, :, :])  # 4d
-            mask_images[:, time_indices, ...] = torch.ones_like(clean_images[:, time_indices, 0, ...])
-            clean_depths_masked = clean_depths * (1 - mask_images)
-            if self.train_with_plucker_coords:
-                if self.use_rendering:
-                    clean_images_masked = clean_depths_masked
-                else:
-                    clean_images_masked = torch.cat([clean_depths_masked[:, :, None, :, :], clean_images[:, :, 1:, :, :]], dim=2)
-            else:
-                clean_images_masked = clean_depths_masked
-            model_inputs = torch.cat([
-                noisy_images.reshape(B, -1, H, W),
-                clean_images_masked.reshape(B, -1, H, W),
-                mask_images.reshape(B, T, H, W)], dim=1)
 
         if self.use_rendering:
             output_indices = time_indices.clone()
             input_indices = torch.Tensor([i for i in range(self.n_input + self.n_output) if i not in output_indices]).int()
 
         for t in self.progress_bar(self.scheduler.timesteps):
+            # 0. prepare the model inputs
+            # choose the type of masking strategy
+            # remember that both the clean and noisy images are 5D tensors now
+            if self.train_with_plucker_coords:
+                if self.use_rendering:
+                    noisy_images = image
+                else:
+                    noisy_images = torch.cat([image[:, :, None, :, :], clean_images[:, :, 1:, :, :]], dim=2)
+            else:
+                noisy_images = image
+
+            if self.masking_strategy == "none":
+                # merge the timesteps and height dimension of all voxel grids
+                model_inputs = torch.cat([
+                    noisy_images.reshape(B, T*C, H, W),
+                    clean_images.reshape(B, T*C, H, W)], dim=1)
+
+            elif self.masking_strategy == "all":
+                # merge the timesteps and height dimension of all voxel grids
+                model_inputs = noisy_images.reshape(B, T*C, H, W)
+
+            elif self.masking_strategy == "random" or self.masking_strategy == "random-half" or self.masking_strategy == "half":
+                time_indices_unmasked = torch.Tensor([i for i in range(self.n_output + self.n_input) if i not in time_indices])
+                mask_images = torch.zeros_like(clean_images[:, :, 0, :, :])  # 4d
+                mask_images[:, time_indices, ...] = torch.ones_like(clean_images[:, time_indices, 0, ...])
+                clean_depths_masked = clean_depths * (1 - mask_images)
+                if self.train_with_plucker_coords:
+                    if self.use_rendering:
+                        clean_images_masked = clean_depths_masked
+                    else:
+                        clean_images_masked = torch.cat([clean_depths_masked[:, :, None, :, :], clean_images[:, :, 1:, :, :]], dim=2)
+                else:
+                    clean_images_masked = clean_depths_masked
+                model_inputs = torch.cat([
+                    noisy_images.reshape(B, -1, H, W),
+                    clean_images_masked.reshape(B, -1, H, W),
+                    mask_images.reshape(B, T, H, W)], dim=1)
+
             # 1. Pass the inputs through the model
             if self.use_rendering:
                 model_output = self.unet(

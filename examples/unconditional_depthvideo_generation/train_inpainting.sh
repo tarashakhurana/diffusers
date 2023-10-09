@@ -16,12 +16,13 @@
 
 accelerate launch --main_process_port 29502 train_inpainting.py \
     --train_data_dir /data/tkhurana/TAO-depth/zoe/frames/minitrain/ \
-    --masking_strategy random \
+    --masking_strategy custom \
     --train_batch_size 8 \
-    --output_dir /data3/tkhurana/diffusers/logs/TAO-depth_minitrain_custom-masking_resolution-64_stdunetwithcrossattn_maskedMAE_startfromSD_finetuneverything/ \
+    --output_dir /data3/tkhurana/diffusers/logs/TAO-depth_minitrain_custom-masking_resolution-64_stdunetwithcrossattn_maskedMAE_startfromSD_finetuneverything_lossonlyonmasked_debug/ \
     --resolution 64 \
-    --checkpointing_steps 1000 \
+    --checkpointing_steps 500 \
     --loss_in_2d \
+    --loss_only_on_masked \
     --in_channels 36 \
     --out_channels 12 \
     --train_with_plucker_coords \

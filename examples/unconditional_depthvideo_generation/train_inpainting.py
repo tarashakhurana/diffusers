@@ -190,14 +190,6 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--loss_in_3d",
-        default=False,
-        action="store_true",
-        help=(
-            "If you want the loss to be computed in 3D space. If not set, the loss will be computed in 2D space."
-        ),
-    )
-    parser.add_argument(
         "--loss_in_2d",
         default=False,
         action="store_true",
@@ -368,7 +360,7 @@ def parse_args():
         raise ValueError("You must specify either a dataset name from the hub or a train data directory.")
 
     # assert args.n_input + args.n_output == args.num_images
-    assert args.loss_in_2d or args.loss_in_3d, "at least one loss should be specified"
+    assert args.loss_in_2d, "at least one loss should be specified"
 
     return args
 
@@ -736,6 +728,10 @@ def main(args):
                 rendering_poses = batch["plucker_coords"]
                 clean_images = clean_images[:, :, None, :, :]
 
+            if "indices" in batch:
+                masking_strategy = "custom"
+                time_indices = batch["indices"].flatten().int()
+
             B, T, C, H, W = clean_images.shape
             clean_depths = clean_images[:, :, 0, :, :]
             noise = torch.randn(clean_depths.shape).to(clean_depths.device)
@@ -769,7 +765,7 @@ def main(args):
                 # merge the timesteps and height dimension of all voxel grids
                 model_inputs = noisy_images.reshape(B, T*C, H, W)
 
-            elif args.masking_strategy in ["random", "random-half", "half", "custom"]:
+            elif args.masking_strategy in ["random", "random-half", "half"]:
                 # first pick a random number of frames to mask
                 # then pick above number of frame IDs to mask
                 num_masks = torch.randint(0, args.n_input + args.n_output - 1, (1,)) + 1
@@ -779,13 +775,10 @@ def main(args):
                     num_masks = args.n_input
 
                 time_indices = torch.from_numpy(
-                    np.random.choice(args.n_input + args.n_output, size=(num_masks, ), replace=False)
-                )
+                    np.random.choice(args.n_input + args.n_output, size=(num_masks, ), replace=False))
 
                 if args.masking_strategy == "half":
                     time_indices = torch.arange(args.n_input, args.n_input + args.n_output, 1)
-                if args.masking_strategy == "custom":
-                    time_indices = torch.Tensor([args.num_images]).int()
 
                 mask_images = torch.zeros_like(clean_images[:, :, 0, :, :]) # 4d
                 mask_images[:, time_indices, ...] = torch.ones_like(clean_images[:, time_indices, 0, ...])
@@ -802,12 +795,27 @@ def main(args):
                     clean_images_masked.reshape(B, T*C, H, W),
                     mask_images.reshape(B, T, H, W)], dim=1)
 
+            elif args.masking_strategy == "custom":
+                # if custom masking strategy then time indices should be specified for the entire batch
+
+                clean_images = clean_images.reshape(B*T, C, H, W)
+                clean_depths = clean_depths.reshape(B*T, H, W)
+
+                mask_images = torch.zeros_like(clean_images[:, 0, :, :]) # 4d
+                mask_images[time_indices, ...] = torch.ones_like(clean_images[time_indices, 0, ...])
+                clean_depths_masked = clean_depths * (1 - mask_images)
+                clean_images_masked = clean_depths_masked.reshape(B, T, H, W)
+
+                model_inputs = torch.cat([
+                    noisy_images.reshape(B, T*C, H, W),
+                    clean_images_masked,
+                    mask_images.reshape(B, T, H, W)], dim=1)
+
+                print(clean_images.shape, "5", rendering_poses.shape, time_indices.shape, torch.sum(time_indices), clean_depths_masked.shape, clean_images_masked.shape)
+                print(model_inputs.shape)
 
             if args.use_rendering:
-                output_indices = time_indices.clone()
-                input_indices = torch.Tensor([i for i in range(args.n_input + args.n_output) if i not in output_indices]).int()
-                # output_indices = torch.Tensor([i for i in range(args.n_input + args.n_output)]).int()
-                # input_indices = torch.Tensor([i for i in range(args.n_input + args.n_output)]).int()
+                inputoutput_indices = time_indices.clone()
 
             with accelerator.accumulate(model):
                 # Predict the noise residual
@@ -817,53 +825,30 @@ def main(args):
                             model_inputs,
                             timesteps,
                             encoder_hidden_states=rendering_poses,
-                            input_indices=input_indices,
-                            output_indices=output_indices).sample
+                            input_indices=inputoutput_indices,
+                            output_indices=None).sample
                 else:
                     model_output = model(model_inputs, timesteps).sample
 
                 if args.loss_only_on_masked:
+                    print("model output shape", model_output.shape, time_indices.shape, noise.shape)
                     loss_indices = time_indices
+                    model_output = model_output.reshape(B*T, H, W)
+                    noise = noise.reshape(B*T, H, W)
                 else:
+                    assert args.loss_only_on_masked
                     loss_indices = [fn for fn in range(args.n_input + args.n_output)]
-
-                if args.loss_in_3d:
-                    assert args.prediction_type == "sample"
-                    model_output = model_output.reshape(B, T, H, W)
-                    model_output_01 = (model_output / 2 + 0.5).clip(0, 1)
-                    clean_depths_01 = (clean_depths / 2 + 0.5).clip(0, 1)
-                    image_plane_in_cam = batch["image_plane_in_cam"][:, loss_indices, ...].to(clean_depths.device)
-                    Rt = batch["Rt"][:, loss_indices, ...].to(clean_depths.device)
-                    prediction_in_3d = utils.get_points_given_imageplane(image_plane_in_cam, model_output_01[:, loss_indices, None, ...], Rt, 100.0)
-                    groundtruth_in_3d = utils.get_points_given_imageplane(image_plane_in_cam, clean_depths_01[:, loss_indices, None, ...], Rt, 100.0)
-                    loss_3d = F.mse_loss(prediction_in_3d, groundtruth_in_3d)
-
-                    """
-                    # visualize for debugging
-                    # shape of clean depths: B T 3 H W
-                    filenames = batch["filenames"]
-                    pcds = groundtruth_in_3d.permute(0, 1, 3, 4, 2).reshape(B, -1, 3)
-                    for p, pcd in enumerate(pcds):
-                        fn = str(filenames[p][0]).split("/")[6]
-                        write_pointcloud(f"/data/tkhurana/visualizations/loss_in_3d/{step}_{p}_{fn}.ply", pcd)
-                        for t in range(T):
-                            fn = str(filenames[p][t]).split("/")
-                            fn = fn[6] + "_" + fn[8][:-4]
-                            plt.imsave(f"/data/tkhurana/visualizations/loss_in_3d/depthmaps_{step}_{p}_{t}_{fn}.png", clean_depths_01[p,t].cpu().numpy())
-                    """
-                else:
-                    loss_3d = 0.0
 
                 if args.loss_in_2d:
                     if args.prediction_type == "epsilon":
-                        loss_2d = F.mse_loss(model_output[:, loss_indices, ...], noise[:, loss_indices, ...])  # this could have different weights!
+                        loss_2d = F.mse_loss(model_output[loss_indices, ...], noise[loss_indices, ...])  # this could have different weights!
                     elif args.prediction_type == "sample":
                         alpha_t = _extract_into_tensor(
                             noise_scheduler.alphas_cumprod, timesteps, (clean_depths.shape[0], 1, 1, 1)
                         )
                         snr_weights = alpha_t / (1 - alpha_t)
                         loss_val = snr_weights * F.mse_loss(
-                                model_output[:, loss_indices, ...], clean_depths[:, loss_indices, ...], reduction="none"
+                                model_output[loss_indices, ...], clean_depths[loss_indices, ...], reduction="none"
                         )  # use SNR weighting from distillation paper
                         loss_2d = loss_val.mean()
                     else:
@@ -871,7 +856,7 @@ def main(args):
                 else:
                     loss_2d = 0.0
 
-                loss = loss_2d + loss_3d
+                loss = loss_2d
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
