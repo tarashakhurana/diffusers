@@ -969,8 +969,8 @@ class TAOMAEDataset(Dataset):
             #
             end_index = len(self.filenames)
             #
-            valid_start_index = start_index + self.num_images * self.fps
-            valid_end_index = end_index - self.num_images * self.fps
+            valid_start_index = start_index + self.horizon * self.fps * 2
+            valid_end_index = end_index - self.horizon * self.fps * 2
             self.seq_to_startend[seq] = (valid_start_index, valid_end_index)
             self.valid_indices += list(range(valid_start_index, valid_end_index))
 
@@ -1006,11 +1006,15 @@ class TAOMAEDataset(Dataset):
                 replace=False)[0]
         context_index = sorted(np.random.choice(
                 np.arange(
-                    ref_start,
-                    max(ref_start + self.num_images, ref_index - self.horizon * self.fps)),
+                    max(ref_start, ref_index - self.horizon * self.fps),
+                    ref_index),
                 size=(self.num_images,),
                 replace=False
                 ))
+        print("query index start and end", max(ref_start, ref_index - self.horizon * self.fps), min(ref_end, ref_index + self.horizon * self.fps))
+        print("context index start and end", max(ref_start, ref_index - self.horizon * self.fps), ref_index)
+        print("ref index", ref_index)
+        print("all index", context_index, query_index)
         input_index = list(context_index) + [query_index]
         depth_frames = []
         all_filenames = []
@@ -1039,6 +1043,15 @@ class TAOMAEDataset(Dataset):
 
         depth_video = torch.stack(depth_frames, axis=0)
         label_video = torch.stack(index_labels, axis=0)
+
+        if self.visualize:
+            fig = plt.figure()
+            for j in range(self.num_images+1):
+                plt.subplot(1, self.num_images+1, j+1)
+                print("depth video shape", depth_video.shape, depth_video[j].shape)
+                plt.imshow(depth_video[j].numpy())
+                plt.title(str(label_video[j]))
+            plt.show()
 
         example["input"] = depth_video  # video is of shape T x H x W or T x C x H x W
         example["filenames"] = all_filenames
@@ -1476,16 +1489,17 @@ class TAOTemporalSuperResolutionDataset(Dataset):
 
 
 if __name__ == "__main__":
-    dataset = TAOTemporalSuperResolutionDataset(
+    dataset = TAOMAEDataset(
         instance_data_root="../../../TAO-depth/frames/test/",
         size=64,
         center_crop=False,
-        num_images=12,
-        batch_size=4,
+        num_images=3,
         split="train",
         normalization_factor=20480.0,
         visualize=True
     )
     for i in range(len(dataset)):
+        if i < 600:
+            continue
         print(dataset[i])
 
