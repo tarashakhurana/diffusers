@@ -27,6 +27,7 @@ from torchvision import transforms
 from tqdm.auto import tqdm
 from pathlib import Path
 from matplotlib import pyplot as plt
+from scipy.interpolate import interpn
 
 import utils
 
@@ -920,6 +921,7 @@ class TAOMAEDataset(Dataset):
         horizon=3,
         center_crop=True,
         fps=30,
+        interpolation_baseline=False,
         normalization_factor=20480.0,
         visualize=False,
     ):
@@ -930,6 +932,7 @@ class TAOMAEDataset(Dataset):
         self.fps = fps
         self.horizon = horizon
         self.visualize = visualize
+        self.interpolation_baseline = interpolation_baseline
         self.normalization_factor = normalization_factor
 
         self.instance_data_root = Path(instance_data_root)
@@ -1000,27 +1003,30 @@ class TAOMAEDataset(Dataset):
         ref_end = self.seq_to_startend[ref_seq][1]
         query_index = np.random.choice(
                 np.arange(
-                    max(ref_start, ref_index - self.horizon * self.fps),
-                    min(ref_end, ref_index + self.horizon * self.fps)),
-                size=(1,),
-                replace=False)[0]
+                    max(ref_start - self.horizon * self.fps, ref_index - self.horizon * self.fps),
+                    min(ref_end + self.horizon * self.fps, ref_index + self.horizon * self.fps)),
+                size=(self.num_images + 1,),
+                replace=False)
+        """
         context_index = sorted(np.random.choice(
                 np.arange(
-                    max(ref_start, ref_index - self.horizon * self.fps),
+                    max(ref_start - self.horizon * self.fps, ref_index - self.horizon * self.fps),
                     ref_index),
                 size=(self.num_images,),
                 replace=False
                 ))
-        print("query index start and end", max(ref_start, ref_index - self.horizon * self.fps), min(ref_end, ref_index + self.horizon * self.fps))
-        print("context index start and end", max(ref_start, ref_index - self.horizon * self.fps), ref_index)
-        print("ref index", ref_index)
-        print("all index", context_index, query_index)
-        input_index = list(context_index) + [query_index]
+        """
+        # print("query index start and end", max(ref_start, ref_index - self.horizon * self.fps), min(ref_end, ref_index + self.horizon * self.fps))
+        # print("context index start and end", max(ref_start, ref_index - self.horizon * self.fps), ref_index)
+        # print("ref index", ref_index)
+        # print("all index", context_index, query_index)
+        # input_index = list(context_index) + [query_index]
+        input_index = query_index
         depth_frames = []
         all_filenames = []
         index_labels = []
 
-        for i in list(input_index):
+        for i in input_index:
             query_index = int(i)
 
             all_filenames.append(self.filenames[query_index])
@@ -1044,18 +1050,44 @@ class TAOMAEDataset(Dataset):
         depth_video = torch.stack(depth_frames, axis=0)
         label_video = torch.stack(index_labels, axis=0)
 
+        if self.interpolation_baseline:
+            xx, yy = np.meshgrid(np.arange(self.resolution), np.arange(self.resolution))
+            xx, yy = xx.reshape(-1), yy.reshape(-1)
+            query = np.stack([np.full_like(yy, label_video[-1]), yy, xx], axis=1)
+            interp_depth = interpn(
+                    (label_video[:self.num_images], np.arange(self.resolution), np.arange(self.resolution)),
+                    depth_video[:self.num_images],
+                    query,
+                    method='linear',
+                    fill_value=None,
+                    bounds_error=False)
+            interp_depth = np.clip(interp_depth, 0.0, 1.0)
+            interp_depth = interp_depth.reshape((self.resolution, self.resolution))
+
         if self.visualize:
             fig = plt.figure()
             for j in range(self.num_images+1):
                 plt.subplot(1, self.num_images+1, j+1)
-                print("depth video shape", depth_video.shape, depth_video[j].shape)
                 plt.imshow(depth_video[j].numpy())
                 plt.title(str(label_video[j]))
             plt.show()
+            if self.interpolation_baseline:
+                fig = plt.figure()
+                for j in range(self.num_images+1):
+                    plt.subplot(1, self.num_images+1, j+1)
+                    if j == self.num_images:
+                        plt.imshow(interp_depth)
+                        plt.title("interp depth at", str(label_video[j]))
+                    else:
+                        plt.imshow(depth_video[j].numpy())
+                        plt.title(str(label_video[j]))
+                plt.show()
 
         example["input"] = depth_video  # video is of shape T x H x W or T x C x H x W
         example["filenames"] = all_filenames
         example["plucker_coords"] = label_video
+        if self.interpolation_baseline:
+            example["interp_depth"] = interp_depth
 
         return example
 
