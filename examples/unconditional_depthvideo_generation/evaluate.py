@@ -1,17 +1,20 @@
 import os
 
-from numpy.ma import masked
-
+from matplotlib.cbook import time
 import torch
 import inspect
 import argparse
 import numpy as np
 from prettytable import PrettyTable
-from diffusers import DDPMDepthPoseInpaintingPipeline, DDPMReconstructionPipeline
-from diffusers import UNet2DModel, DDPMScheduler
+from PIL import Image
+from torchvision import transforms
+from diffusers import DDPMPipeline, DDPMDepthPoseInpaintingPipeline, DDPMInpaintingPipeline, DDPMReconstructionPipeline
+from diffusers import DPMSolverMultistepScheduler, UNet2DModel, UNet2DConditionRenderModel, DDPMScheduler, DDIMScheduler, DDPMConditioningScheduler
+import matplotlib.cm
 
 import utils
-from data import OccfusionDataset, collate_fn_depthpose, collate_fn_inpainting
+from data import DebugDataset, OccfusionDataset, collate_fn_depthpose, collate_fn_inpainting, TAOTemporalSuperResolutionDataset, collate_fn_temporalsuperres
+from utils import render_path_spiral, write_pointcloud
 
 
 def parse_args():
@@ -108,7 +111,7 @@ def parse_args():
     parser.add_argument(
         "--scale_factor",
         type=float,
-        default=10.0,
+        default=100.0,
         help=(
             "Factor to multiply the output by in order to get the predictions in a metric space"
         ),
@@ -147,11 +150,19 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--fair_comparison",
+        "--use_rendering",
         default=False,
         action="store_true",
         help=(
-            "Whether to fix the number of masks and the masked indices for all experiments."
+            "Whether to use rendering at the end of the network"
+        ),
+    )
+    parser.add_argument(
+        "--use_harmonic",
+        default=False,
+        action="store_true",
+        help=(
+            "Whether to use rendering at the end of the network"
         ),
     )
     parser.add_argument(
@@ -188,7 +199,7 @@ def parse_args():
         "--masking_strategy",
         type=str,
         default="random",
-        choices=["all", "none", "random", "random-half", "random"],
+        choices=["all", "none", "random", "random-half", "half", "custom"],
     )
     parser.add_argument(
         "--model_type",
@@ -198,6 +209,7 @@ def parse_args():
         help="Whether the model should predict the 'epsilon'/noise error or directly the reconstructed image 'x0'.",
     )
     parser.add_argument("--ddpm_num_steps", type=int, default=1000)
+    parser.add_argument("--shuffle_video", action="store_true")
     parser.add_argument("--ddpm_num_inference_steps", type=int, default=1000)
     parser.add_argument("--num_inference_steps", type=int, default=40)
     parser.add_argument("--ddpm_beta_schedule", type=str, default="linear")
@@ -205,8 +217,6 @@ def parse_args():
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
-
-    assert args.n_input + args.n_output == args.num_images, "n_input + n_output must equal num_images"
 
     if args.dataset_name is None and args.eval_data_dir is None:
         raise ValueError("You must specify either a dataset name from the hub or a train data directory.")
@@ -217,10 +227,16 @@ def parse_args():
 def main(args):
     # Initialize the UNet2D
     Scheduler = DDPMScheduler  # DDPMConditioningScheduler
-    unet = UNet2DModel.from_pretrained(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/unet")
+    if args.use_rendering:
+        assert args.train_with_plucker_coords
+        # assert args.prediction_type == "sample"
+        UNetModel = UNet2DConditionRenderModel
+    else:
+        UNetModel = UNet2DModel
+    unet = UNetModel.from_pretrained(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/unet")
     unet = unet.to("cuda:0")
 
-
+    """
     dataset = OccfusionDataset(
         instance_data_root=args.eval_data_dir,
         size=args.resolution,
@@ -229,10 +245,35 @@ def main(args):
         offset=args.offset,
         normalization_factor=args.normalization_factor,
         plucker_coords=args.train_with_plucker_coords,
-        use_harmonic=False,
-        visualize=False,
+        plucker_resolution=[64, 32, 16] if args.use_rendering else [64],
+        shuffle_video=args.shuffle_video,
+        use_harmonic=args.use_harmonic,
+        visualize=True,
         spiral_poses=args.visualize_spiral,
     )
+    """
+    dataset = DebugDataset(
+        instance_data_root=args.eval_data_dir,
+        size=args.resolution,
+        center_crop=args.center_crop,
+        num_images=args.num_images,
+        offset=args.offset,
+        split="val",
+        normalization_factor=args.normalization_factor,
+        visualize=False
+    )
+    """
+    dataset = TAOTemporalSuperResolutionDataset(
+        instance_data_root=args.eval_data_dir,
+        size=args.resolution,
+        center_crop=args.center_crop,
+        num_images=args.num_images,
+        batch_size=args.eval_batch_size,
+        split="train",
+        normalization_factor=args.normalization_factor,
+        visualize=False
+    )
+    """
 
     assert args.eval_batch_size == 1, "eval batch size must be 1"
 
@@ -270,6 +311,7 @@ def main(args):
         kwargs["n_output"] = args.n_output
         kwargs["masking_strategy"] = args.masking_strategy
         kwargs["train_with_plucker_coords"] = args.train_with_plucker_coords
+        kwargs["use_rendering"] = args.use_rendering
         pipeline = DDPMDepthPoseInpaintingPipeline(unet=unet, scheduler=noise_scheduler, kwargs=kwargs)
         # pipeline = DDPMInpaintingPipeline(unet=unet, scheduler=noise_scheduler)
     elif args.model_type == "depthpose":
@@ -278,28 +320,43 @@ def main(args):
         kwargs["n_output"] = args.n_output
         kwargs["masking_strategy"] = args.masking_strategy
         kwargs["train_with_plucker_coords"] = args.train_with_plucker_coords
+        kwargs["use_rendering"] = args.use_rendering
         pipeline = DDPMDepthPoseInpaintingPipeline(unet=unet, scheduler=noise_scheduler, kwargs=kwargs)
 
+    generator = torch.Generator(device=pipeline.device).manual_seed(0)
     # run pipeline in inference (sample random noise and denoise)
-    top1_metric, top3_metric = 0, 0
-    top1_inv_metric, top3_inv_metric = 0, 0
+
+    top1_metric, top3_metric, top5_metric = 0, 0, 0
+    top1_inv_metric, top3_inv_metric, top5_inv_metric = 0, 0, 0
     count = 0
 
-    headers = ['Top1', 'Top1 (inv)', 'Top3', 'Top3 (inv)']
+    headers = ['Top1', 'Top1 (inv)', 'Top3', 'Top3 (inv)', 'Top5', 'Top5 (inv)']
 
-    for b, batch in enumerate(tqdm(eval_dataloader)):
+    for b, batch in enumerate(eval_dataloader):
 
-        dp = batch["input"]
-        data_point = torch.stack([dp[0]] * 3).to("cuda:0")
-        B, T, C, H, W = data_point.shape
+        # if b != 3:
+        #     continue
+
+        data_point = batch["input"].to("cuda:0")
+
+        if args.train_with_plucker_coords:
+            plucker = batch["plucker_coords"].to("cuda:0")
+            # print("found frame idS to be", data_point.shape, plucker.shape)
+            # plucker = [pc.to("cuda:0") for pc in batch["plucker_coords"]]
+            # ray_origin = batch["ray_origin"]
+            # ray_direction = batch["ray_direction"]
+            # cam_coords = batch["cam_coords"]
+
         total_frames = data_point.shape[1]
-        past_frames = torch.stack([data_point[0, :int(total_frames / 2), ...]] * 3)
-        batch_size = 3
+        past_frames = torch.stack([data_point[0, :int(total_frames / 2), ...]] * 1)
+        future_frames = torch.stack([data_point[0, int(total_frames / 2):, ...]] * 1)
+        data_point = torch.stack([data_point[0, ...]] * 5)
+        plucker = torch.stack([plucker[0, ...]] * 5)
+        print("data point and plucker shape", data_point.shape, plucker.shape)
 
-        if args.fair_comparison:
-            assert args.masking_strategy == "random", "fair comparison only works with random masking"
-            time_indices = [1, 3, 5, 7, 9]
-            args.num_masks = 5
+        time_indices = torch.Tensor([3]).int() # [0,1,2,3,4,5,7,8,9,10,11]
+        args.num_masks = 1  # 11
+        batch_size = 5
 
         if args.model_type == "reconstruction":
             prediction = pipeline(
@@ -317,23 +374,26 @@ def main(args):
                     output_type="numpy",
                     user_num_masks=args.num_masks,
                     user_time_indices=time_indices).images
-            masked_indices = [i for i in range(total_frames) if i not in unmasked_indices]
+            masked_indices = np.array([i for i in range(args.n_input + args.n_output) if i not in unmasked_indices.tolist()])
         elif args.model_type == "depthpose":
+            print("getting predictions using args.num_masks", args.num_masks)
             prediction, unmasked_indices = pipeline(
-                    inpainting_image=data_point,
+                    inpainting_image=(data_point, plucker),
                     batch_size=batch_size,
                     num_inference_steps=args.num_inference_steps,
                     output_type="numpy",
                     user_num_masks=args.num_masks,
                     user_time_indices=time_indices,
                 ).images
-            masked_indices = [i for i in range(total_frames) if i not in unmasked_indices]
+            masked_indices = np.array([i for i in range(args.n_input + args.n_output) if i not in unmasked_indices.tolist()])
 
         prediction = torch.from_numpy(prediction).permute(0, 3, 1, 2)
         B, T, H, W = prediction.shape
         count += 1
 
-        groundtruth = data_point[:, :, 0, ...].cpu()
+
+        assert data_point.ndim == 4
+        groundtruth = data_point.cpu()
 
         # shapes of prediction are batch x frames x height x width
         # shapes of groundtruth is the same
@@ -349,13 +409,17 @@ def main(args):
         top3_metric += utils.topk_l1_error(top3_prediction, top3_groundtruth)
         top3_inv_metric += utils.topk_scaleshift_inv_l1_error(top3_prediction, top3_groundtruth)
 
-        all_metrics = np.array([top1_metric, top1_inv_metric, top3_metric, top3_inv_metric])
+        top5_prediction = prediction[:5, masked_indices, ...]
+        top5_groundtruth = groundtruth[:5, masked_indices, ...]
+        top5_metric += utils.topk_l1_error(top5_prediction, top5_groundtruth)
+        top5_inv_metric += utils.topk_scaleshift_inv_l1_error(top5_prediction, top5_groundtruth)
+
+        all_metrics = np.array([top1_metric, top1_inv_metric, top3_metric, top3_inv_metric, top5_metric, top5_inv_metric])
         all_metrics /= count
 
         tab = PrettyTable(headers)
         tab.add_rows([list(all_metrics)])
         print(tab)
-
 
 if __name__ == "__main__":
     args = parse_args()

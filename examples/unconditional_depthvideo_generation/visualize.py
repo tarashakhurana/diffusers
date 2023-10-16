@@ -8,7 +8,7 @@ import numpy as np
 from PIL import Image
 from torchvision import transforms
 from diffusers import DDPMPipeline, DDPMDepthPoseInpaintingPipeline, DDPMInpaintingPipeline, DDPMReconstructionPipeline
-from diffusers import DPMSolverMultistepScheduler, UNet2DModel, UNet2DConditionRenderModel, DDPMScheduler, DDPMConditioningScheduler
+from diffusers import DPMSolverMultistepScheduler, UNet2DModel, UNet2DConditionRenderModel, DDPMScheduler, DDIMScheduler, DDPMConditioningScheduler
 import matplotlib.cm
 
 import utils
@@ -225,7 +225,7 @@ def parse_args():
 
 def main(args):
     # Initialize the UNet2D
-    Scheduler = DDPMScheduler  # DDPMConditioningScheduler
+    Scheduler = DDIMScheduler  # DDPMConditioningScheduler
     if args.use_rendering:
         assert args.train_with_plucker_coords
         # assert args.prediction_type == "sample"
@@ -345,11 +345,10 @@ def main(args):
         total_frames = data_point.shape[1]
         past_frames = torch.stack([data_point[0, :int(total_frames / 2), ...]] * 1)
         future_frames = torch.stack([data_point[0, int(total_frames / 2):, ...]] * 1)
-        # data_point = torch.stack([data_point[0, ...]] * 4)
-        # plucker = torch.stack([plucker[0, ...]] * 4)
-        # print(plucker.shape, plucker[:, 6:7, :].shape, ((torch.arange(4)[:, None, None].to("cuda:0") / 3) *  (plucker[:, 6:7, :] - plucker[:, 5:6, :])).shape)
-        # plucker[:, 6:7, :] = plucker[:, 6:7, :] + (torch.arange(4)[:, None, None].to("cuda:0") / 3) *  (plucker[:, 6:7, :] - plucker[:, 5:6, :])
-        # batch_size = 4
+        data_point = torch.stack([data_point[0, ...]] * 4)
+        plucker = torch.stack([plucker[0, ...]] * 4)
+        plucker[:, 3:4, :] = plucker[:, 3:4, :] + torch.arange(4)[:, None, None].to("cuda:0")
+        batch_size = 4
         print("data point and plucker shape", data_point.shape, plucker.shape)
 
         if args.visualize_spiral:
@@ -363,9 +362,8 @@ def main(args):
             data_point = data_point[0]
             plucker = plucker[0]
         else:
-            time_indices = torch.Tensor([3]).int()  # [0,1,2,3,4,5,7,8,9,10,11]
+            time_indices = torch.Tensor([3]).int() # [0,1,2,3,4,5,7,8,9,10,11]
             args.num_masks = 1  # 11
-            batch_size = 1
 
         if args.model_type == "reconstruction":
             prediction = pipeline(
@@ -469,10 +467,10 @@ def main(args):
                 all_points = np.concatenate(all_points, axis=0)
                 all_colors = np.concatenate(all_colors, axis=0)
                 all_edges = np.stack(all_edges, axis=0)
-                write_pointcloud(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals_debug/3d_{count}.ply", all_points, all_colors, edges=all_edges)
+                write_pointcloud(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals_constnoise_ddim/3d_{count}.ply", all_points, all_colors, edges=all_edges)
 
-            os.makedirs(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals_debug", exist_ok=True)
-            utils.make_gif(colored_images, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals_debug/2d_{count}.gif", duration=800)
+            os.makedirs(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals_constnoise_ddim", exist_ok=True)
+            utils.make_gif(colored_images, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals_constnoise_ddim/2d_{count}.gif", duration=800)
 
         batch_colored_images_toplot = []
         widths, heights = zip(*(i.size for i in batch_colored_images[0]))
@@ -487,11 +485,11 @@ def main(args):
                 x_offset += batch_colored_images[b][i].size[0]
             batch_colored_images_toplot.append(new_im)
 
-        utils.make_gif(batch_colored_images_toplot, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals_debug/batch_2d_{count}.gif", duration=800)
+        utils.make_gif(batch_colored_images_toplot, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals_constnoise_ddim/batch_2d_{count}.gif", duration=800)
 
         if args.visualize_spiral:
             spiral.append(colored_images[6])
-            utils.make_gif(spiral, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals_debug/spiral_{count}.gif", duration=800)
+            utils.make_gif(spiral, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals_constnoise_ddim/spiral_{count}.gif", duration=800)
 
 
 if __name__ == "__main__":

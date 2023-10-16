@@ -904,7 +904,7 @@ class ObjaverseDataset(Dataset):
         return example
 
 
-class DebugDataset(Dataset):
+class TAOMAEDataset(Dataset):
     """
     A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
     It pre-processes the images and the tokenizes prompts.
@@ -915,21 +915,20 @@ class DebugDataset(Dataset):
         instance_data_root,
         size=256,
         num_images=3,
-        offset=15,
         split="train",
         ext=["png"],
         center_crop=True,
+        fps=30,
         normalization_factor=20480.0,
         visualize=False,
     ):
         self.size = size
-        self.offset = offset
         self.center_crop = center_crop
         self.num_images = num_images
         self.split = split
+        self.fps = fps
         self.visualize = visualize
         self.normalization_factor = normalization_factor
-        self.sequence = num_images > 1
 
         self.instance_data_root = Path(instance_data_root)
         if not self.instance_data_root.exists():
@@ -943,40 +942,36 @@ class DebugDataset(Dataset):
         seq_to_frames = {}
         self.seq_to_startend = {}
 
-        if "pointodyssey" in str(self.instance_data_root):
-            for e in ext:
-                all_frames.extend(sorted(list(self.instance_data_root.rglob(f"*/depths/depth_*.{e}"))))
-        else:
-            for e in ext:
-                all_frames.extend(sorted(list(self.instance_data_root.rglob(f"*.{e}"))))
+        for e in ext:
+            all_frames.extend(sorted(list(self.instance_data_root.rglob(f"*.{e}"))))
 
         all_frames = list(all_frames)
 
         self.paths = all_frames
 
-        if self.sequence:
-            for frame in all_frames:
-                seq = str(frame)[len(str(self.instance_data_root)) + 1:str(frame).rfind("/")]
-                if seq not in seq_to_frames:
-                    seq_to_frames[seq] = []
-                seq_to_frames[seq].append(frame)
+        for frame in all_frames:
+            seq = str(frame)[len(str(self.instance_data_root)) + 1:str(frame).rfind("/")]
+            if seq not in seq_to_frames:
+                seq_to_frames[seq] = []
+            seq_to_frames[seq].append(frame)
 
-            for seq in seq_to_frames:
-                frames = seq_to_frames[seq]
-                start_index = len(self.filenames)
+        for seq in seq_to_frames:
+            frames = seq_to_frames[seq]
+            start_index = len(self.filenames)
 
-                for idx in range(0, len(frames), self.offset):
-                    frame_path = frames[idx]
-                    self.sequences.append(seq)
-                    self.filenames.append(frame_path)
+            for idx in range(0, len(frames)):
+                frame_path = frames[idx]
+                self.sequences.append(seq)
+                self.filenames.append(frame_path)
 
-                #
-                end_index = len(self.filenames)
-                #
-                valid_start_index = start_index
-                valid_end_index = end_index - self.num_images
-                self.seq_to_startend[seq] = (valid_start_index, valid_end_index)
-                self.valid_indices += list(range(valid_start_index, valid_end_index))
+            #
+            end_index = len(self.filenames)
+            #
+            valid_start_index = start_index
+            valid_end_index = end_index - self.num_images
+            self.seq_to_startend[seq] = (valid_start_index, valid_end_index)
+            self.valid_indices += list(range(valid_start_index, valid_end_index))
+
         self.num_instance_images = len(self.valid_indices)
         self._length = self.num_instance_images
 
@@ -999,24 +994,159 @@ class DebugDataset(Dataset):
         example = {}
         ref_index = self.valid_indices[index]
         ref_seq = self.sequences[ref_index]
-        start = self.seq_to_startend[ref_seq][0]
-        end = self.seq_to_startend[ref_seq][1]
-        if ref_index + 1 == min(end, ref_index + 20):
-            future_index = np.array([ref_index])
-        else:
-            future_index = np.random.choice(np.arange(ref_index + 1, min(end, ref_index + 20)), size=(1,), replace=False)
+        ref_start = self.seq_to_startend[ref_seq][0]
+        ref_end = self.seq_to_startend[ref_seq][1]
+        input_index = np.random.choice(np.arange(ref_start, ref_end), size=(self.num_images + 1,), replace=False)
         depth_frames = []
         all_filenames = []
         index_labels = []
 
-        for i in list(range(self.num_images)) + [future_index[0]]:
-            if i < self.num_images:
-                query_index = int(ref_index + i)
-            else:
-                query_index = int(i)
+        for i in list(input_index):
+            query_index = int(i)
 
             all_filenames.append(self.filenames[query_index])
 
+            curr_seq = self.sequences[query_index]
+            assert ref_seq == curr_seq
+
+            depth = cv2.imread(str(self.filenames[query_index]), cv2.IMREAD_ANYDEPTH)
+            depth = depth.astype(np.float32) / self.normalization_factor
+
+            # in TAO, we predicted per frame relative depth
+            depth = (depth - depth.min()) / (depth.max() - depth.min()) * 255.0
+
+            depth_preprocessed = self.image_transforms(Image.fromarray(depth.astype("uint8"))).squeeze()
+            depth_frames.append(depth_preprocessed)
+
+            index_label = torch.Tensor([i - input_index[self.num_images-1]]) / self.fps
+
+            index_labels.append(index_label)
+
+        depth_video = torch.stack(depth_frames, axis=0)
+        label_video = torch.stack(index_labels, axis=0)
+
+        example["input"] = depth_video  # video is of shape T x H x W or T x C x H x W
+        example["filenames"] = all_filenames
+        example["plucker_coords"] = label_video
+
+        return example
+
+
+class DeformingThing4DDataset(Dataset):
+    """
+    A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
+    It pre-processes the images and the tokenizes prompts.
+    """
+
+    def __init__(
+        self,
+        instance_data_root,
+        size=256,
+        num_images=3,
+        total_seconds=6,
+        fps=30,
+        batch_size=4,
+        split="train",
+        ext=["png"],
+        center_crop=True,
+        normalization_factor=20480.0,
+        visualize=False,
+    ):
+        self.size = size
+        self.center_crop = center_crop
+        self.num_images = num_images
+        self.split = split
+        self.visualize = visualize
+        self.total_seconds = total_seconds
+        self.fps = fps
+        self.batch_size = batch_size
+        self.normalization_factor = normalization_factor
+
+        self.instance_data_root = Path(instance_data_root)
+        if not self.instance_data_root.exists():
+            raise ValueError(f"Instance {self.instance_data_root} images root doesn't exists.")
+
+        # NOTE:
+        self.sequences = defaultdict(list)
+        self.filenames = defaultdict(list)
+        self.valid_frames = []
+        all_frames = []
+        seq_to_frames = defaultdict(list)
+
+        for e in ext:
+            all_frames.extend(sorted(list(self.instance_data_root.rglob(f"*/spacetime_renderings/*.{e}"))))
+
+        all_frames = list(all_frames)
+
+        self.paths = all_frames
+
+        for frame in all_frames:
+            seq = str(frame)[len(str(self.instance_data_root)) + 1:str(frame).rfind("/")]
+            seq_to_frames[seq].append(frame)
+
+        all_seqs = random.shuffle(list(seq_to_frames.keys()))
+        if self.split == "train":
+            sequences = all_seqs[:int(0.8*len(all_seqs))]
+        elif self.split == "val":
+            sequences = all_seqs[int(0.8*len(all_seqs)): int(0.9*len(all_seqs))]
+        elif self.split == "test":
+            sequences = all_seqs[int(0.9*len(all_seqs)):]
+
+        for seq in sequences:
+            frames = seq_to_frames[seq]
+
+            startend_frames = []
+            for idx in range(len(frames)):
+                frame_path = frames[idx]
+                frame_path_time = frame_path[:frame_path.find("time0")+8]
+                self.sequences[frame_path_time].append(seq)
+                self.filenames[frame_path_time].append(frame_path)
+                startendframes.append(frame_path_time)
+
+            #
+            offset = int(self.total_seconds * self.fps)
+            self.valid_frames += list(startendframes[offset:])
+
+        self._length = len(self.valid_frames)
+
+        print("found length to be", self._length)
+
+        self.image_transforms = transforms.Compose(
+            [
+                transforms.Resize(size, interpolation=transforms.InterpolationMode.NEAREST),
+                transforms.CenterCrop(size),
+                transforms.ToTensor(),
+                # brings the training data between -1 and 1
+                transforms.Normalize([0.5], [0.5]),
+            ]
+        )
+
+    def __len__(self):
+        return self._length
+
+    def __getitem__(self, index):
+        example = {}
+        ref_frame = self.valid_frames[index]
+        ref_frame_views = self.sequences[ref_frame]
+        # start = ref_index - self.total_seconds * self.fps
+        # end = ref_index
+        batch_depthframes = []
+        batch_filenames = []
+        batch_labels = []
+        batch_indices = []
+
+        # prepare the input conditioning frames
+        num_input = np.random.randint(1, self.num_images)
+        input_depthframes = []
+        input_filenames = []
+        input_labels = []
+        input_indices = np.random.choice(
+                np.arange(start, end),
+                size=(num_input,),
+                replace=False)
+
+        for query_index in input_indices:
+            input_filenames.append(self.filenames[query_index])
             curr_seq = self.sequences[query_index]
             assert ref_seq == curr_seq
 
@@ -1033,23 +1163,87 @@ class DebugDataset(Dataset):
                 depth = (depth - depth.min()) / (depth.max() - depth.min()) * 255.0
 
             depth_preprocessed = self.image_transforms(Image.fromarray(depth.astype("uint8"))).squeeze()
-            depth_frames.append(depth_preprocessed)
+            input_depthframes.append(depth_preprocessed)
+            input_labels.append([int(query_index)])
 
-            if i < self.num_images:
-                index_label = torch.Tensor([i - self.num_images + 1])
-            else:
-                index_label = torch.Tensor([i - ref_index])
 
-            index_labels.append(index_label)
+        # prepare the output conditioning frames
+        num_output = self.num_images - num_input
 
-        depth_video = torch.stack(depth_frames, axis=0)
-        label_video = torch.stack(index_labels, axis=0)
+        for i in range(self.batch_size):
+            output_indices = np.random.choice(
+                    [n for n in range(start, end) if n not in input_indices],
+                    size=(num_output,),
+                    replace=False)
+            output_depthframes = []
+            output_filenames = []
+            output_labels = []
 
-        example["input"] = depth_video  # video is of shape T x H x W or T x C x H x W
-        example["filenames"] = all_filenames
+            for query_index in output_indices:
+                output_filenames.append(self.filenames[query_index])
+                curr_seq = self.sequences[query_index]
+                assert ref_seq == curr_seq
+
+                depth = cv2.imread(str(self.filenames[query_index]), cv2.IMREAD_ANYDEPTH)
+                depth = depth.astype(np.float32) / self.normalization_factor
+
+                if "pointodyssey" in str(self.filenames[query_index]):
+                    depth = np.where(depth > 100.0, 100.0, depth)
+                    depth = depth / 100.0
+                    depth_clipped = np.clip(depth, 0, 1)
+                    depth = depth_clipped * 255.0
+                else:
+                    # in TAO, we predicted per frame relative depth
+                    depth = (depth - depth.min()) / (depth.max() - depth.min()) * 255.0
+
+                depth_preprocessed = self.image_transforms(Image.fromarray(depth.astype("uint8"))).squeeze()
+                output_depthframes.append(depth_preprocessed)
+                output_labels.append([int(query_index)])
+
+            # TODO: post process
+            # 1. sort the input+output arrays
+            # 2. choose an anchor which will always appear at t=0 to the network
+            combined_depthframes = torch.stack(input_depthframes + output_depthframes, axis=0)
+            combined_labels = torch.Tensor(input_labels + output_labels)
+            combined_filenames = np.array(input_filenames + output_filenames)
+
+            indices = torch.argsort(combined_labels, dim=0)[:, 0]
+            combined_depthframes = combined_depthframes[indices]
+            combined_filenames = combined_filenames[indices]
+            combined_labels = combined_labels[indices]
+            combined_indices = [int(f) in output_indices for f in combined_labels]
+
+            combined_labels = (combined_labels - ref_index) / self.fps
+
+            batch_depthframes.append(combined_depthframes)
+            batch_filenames.append(combined_filenames)
+            batch_labels.append(combined_labels)
+            batch_indices.append(torch.Tensor(combined_indices))
+
+        depth_video = torch.stack(batch_depthframes, axis=0)
+        label_video = torch.stack(batch_labels, axis=0)
+        index_video = torch.stack(batch_indices, axis=0)
+
+        if self.visualize:
+            for i in range(self.batch_size):
+                fig = plt.figure()
+                for j in range(self.num_images):
+                    plt.subplot(1, self.num_images, j+1)
+                    print("depth video shape", depth_video.shape, depth_video[i, j].shape)
+                    if not index_video[i, j]:
+                        plt.imshow(depth_video[i, j].numpy(), cmap="gray")
+                    else:
+                        plt.imshow(depth_video[i, j].numpy())
+                    plt.title(str(label_video[i, j]) + "\n" + str(index_video[i, j]))
+                plt.show()
+
+        example["input"] = depth_video  # video is of shape B x T x H x W
+        example["filenames"] = batch_filenames
         example["plucker_coords"] = label_video
+        example["indices"] = index_video
 
         return example
+
 
 
 class TAOTemporalSuperResolutionDataset(Dataset):

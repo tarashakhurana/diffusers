@@ -36,7 +36,7 @@ from diffusers.utils.import_utils import is_xformers_available
 
 import utils
 from utils import HarmonicEmbedding, write_pointcloud
-from data import DebugDataset, TAOTemporalSuperResolutionDataset, OccfusionDataset, collate_fn_depthpose, collate_fn_inpainting, collate_fn_temporalsuperres
+from data import DebugDataset, TAOMAEDataset, TAOTemporalSuperResolutionDataset, OccfusionDataset, collate_fn_depthpose, collate_fn_inpainting, collate_fn_temporalsuperres
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.16.0.dev0")
@@ -397,7 +397,7 @@ def main(args):
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.logger,
-        project_dir=logging_dir,
+        logging_dir=logging_dir,
         project_config=accelerator_project_config,
         # kwargs_handlers=[ddp_kwargs]
     )
@@ -516,7 +516,7 @@ def main(args):
                 up_block_types=up_block_types,
             )
         else:
-            # st = torch.load("diffusion_pytorch_model.bin")
+            st = torch.load("diffusion_pytorch_model.bin")
             model = UNetModel(
                 sample_size=args.resolution,
                 in_channels=args.in_channels,
@@ -534,7 +534,6 @@ def main(args):
                 norm_eps=1e-05,
                 norm_num_groups=32
             )
-            """
             for name, params in model.named_parameters():
                 if name in st:
                     if 'attn2' in name:
@@ -542,7 +541,6 @@ def main(args):
                     else:
                         params.data = st[f'{name}']
                         # params.requires_grad = False
-            """
     else:
         config = UNetModel.load_config(args.model_config_name_or_path)
         model = UNetModel.from_config(config)
@@ -615,19 +613,18 @@ def main(args):
         use_harmonic=args.use_harmonic,
         visualize=args.visualize_dataloader
     )
-
-    dataset = DebugDataset(
+    """
+    dataset = TAOMAEDataset(
         instance_data_root=args.train_data_dir,
         size=args.resolution,
         center_crop=args.center_crop,
         num_images=args.num_images,
-        offset=args.offset,
+        fps=args.fps,
         split="train",
         normalization_factor=args.normalization_factor,
         visualize=args.visualize_dataloader
     )
     """
-
     dataset = TAOTemporalSuperResolutionDataset(
         instance_data_root=args.train_data_dir,
         size=args.resolution,
@@ -638,10 +635,11 @@ def main(args):
         normalization_factor=args.normalization_factor,
         visualize=args.visualize_dataloader
     )
+    """
 
     if args.train_with_plucker_coords:
         # collate_fn = collate_fn_depthpose
-        collate_fn = collate_fn_temporalsuperres
+        collate_fn = collate_fn_depthpose
     else:
         collate_fn = collate_fn_inpainting
 
@@ -806,7 +804,13 @@ def main(args):
 
             elif args.masking_strategy == "custom":
                 # if custom masking strategy then time indices should be specified for the entire batch
+                time_indices = torch.Tensor([args.num_images])
+                mask_images = torch.zeros_like(clean_images[:, :, 0, :, :]) # 4d
+                mask_images[:, time_indices, ...] = torch.ones_like(clean_images[:, time_indices, 0, ...])
+                clean_depths_masked = clean_depths * (1 - mask_images)
+                clean_images_masked = clean_depths_masked
 
+                """
                 clean_images = clean_images.reshape(B*T, C, H, W)
                 clean_depths = clean_depths.reshape(B*T, H, W)
 
@@ -814,6 +818,7 @@ def main(args):
                 mask_images[time_indices, ...] = torch.ones_like(clean_images[time_indices, 0, ...])
                 clean_depths_masked = clean_depths * (1 - mask_images)
                 clean_images_masked = clean_depths_masked.reshape(B, T, H, W)
+                """
 
                 model_inputs = torch.cat([
                     noisy_images.reshape(B, T*C, H, W),
@@ -838,12 +843,17 @@ def main(args):
 
                 if args.loss_only_on_masked:
                     loss_indices = time_indices
+                    """
                     model_output = model_output.reshape(B*T, H, W)
                     noise = noise.reshape(B*T, H, W)
+                    """
                 else:
-                    assert args.loss_only_on_masked
-                    loss_indices = [fn for fn in range(args.n_input + args.n_output)]
+                    loss_indices = torch.arange(model_output.shape[1]).int()
+                    """
+                    loss_indices = torch.arange(model_output.shape[0]).int()
+                    """
 
+                """
                 if args.loss_in_2d:
                     if args.prediction_type == "epsilon":
                         loss_2d = F.mse_loss(model_output[loss_indices, ...], noise[loss_indices, ...])  # this could have different weights!
@@ -854,6 +864,23 @@ def main(args):
                         snr_weights = alpha_t / (1 - alpha_t)
                         loss_val = snr_weights * F.mse_loss(
                                 model_output[loss_indices, ...], clean_depths[loss_indices, ...], reduction="none"
+                        )  # use SNR weighting from distillation paper
+                        loss_2d = loss_val.mean()
+                    else:
+                        raise ValueError(f"Unsupported prediction type: {args.prediction_type}")
+                else:
+                    loss_2d = 0.0
+                """
+                if args.loss_in_2d:
+                    if args.prediction_type == "epsilon":
+                        loss_2d = F.mse_loss(model_output[:, loss_indices, ...], noise[:, loss_indices, ...])  # this could have different weights!
+                    elif args.prediction_type == "sample":
+                        alpha_t = _extract_into_tensor(
+                            noise_scheduler.alphas_cumprod, timesteps, (clean_depths.shape[0], 1, 1, 1)
+                        )
+                        snr_weights = alpha_t / (1 - alpha_t)
+                        loss_val = snr_weights * F.mse_loss(
+                                model_output[:, loss_indices, ...], clean_depths[:, loss_indices, ...], reduction="none"
                         )  # use SNR weighting from distillation paper
                         loss_2d = loss_val.mean()
                     else:
@@ -976,5 +1003,8 @@ def main(args):
 
 
 if __name__ == "__main__":
+
+    torch.random.manual_seed(0)
+    np.random.seed(0)
     args = parse_args()
     main(args)

@@ -279,7 +279,6 @@ def topk_l1_error(pd, gt):
 
 def topk_scaleshift_inv_l1_error(pd, gt):
     scale, shift = compute_scale_and_shift(pd, gt, torch.ones_like(pd))
-    print(scale.shape, shift.shape, pd.shape)
     pd_ssi = scale[:, None, None, None] * pd + shift[:, None, None, None]
     return topk_l1_error(pd_ssi, gt)
 

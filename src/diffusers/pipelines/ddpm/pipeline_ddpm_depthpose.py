@@ -93,7 +93,7 @@ class DDPMDepthPoseInpaintingPipeline(DiffusionPipeline):
             else:
                 image_shape = (
                     batch_size,
-                    12,
+                    4,
                     self.unet.config.sample_size,
                     self.unet.config.sample_size,
                 )
@@ -110,6 +110,7 @@ class DDPMDepthPoseInpaintingPipeline(DiffusionPipeline):
             image = image.to(self.device)
         else:
             image = randn_tensor(image_shape, generator=generator, device=self.device)
+            # image = image.repeat(batch_size, 1, 1, 1)
 
         # set step values
         self.scheduler.set_timesteps(num_inference_steps)
