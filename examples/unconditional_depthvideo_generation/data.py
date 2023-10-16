@@ -917,6 +917,7 @@ class TAOMAEDataset(Dataset):
         num_images=3,
         split="train",
         ext=["png"],
+        horizon=3,
         center_crop=True,
         fps=30,
         normalization_factor=20480.0,
@@ -927,6 +928,7 @@ class TAOMAEDataset(Dataset):
         self.num_images = num_images
         self.split = split
         self.fps = fps
+        self.horizon = horizon
         self.visualize = visualize
         self.normalization_factor = normalization_factor
 
@@ -967,8 +969,8 @@ class TAOMAEDataset(Dataset):
             #
             end_index = len(self.filenames)
             #
-            valid_start_index = start_index
-            valid_end_index = end_index - self.num_images
+            valid_start_index = start_index + self.num_images * self.fps
+            valid_end_index = end_index - self.num_images * self.fps
             self.seq_to_startend[seq] = (valid_start_index, valid_end_index)
             self.valid_indices += list(range(valid_start_index, valid_end_index))
 
@@ -996,7 +998,20 @@ class TAOMAEDataset(Dataset):
         ref_seq = self.sequences[ref_index]
         ref_start = self.seq_to_startend[ref_seq][0]
         ref_end = self.seq_to_startend[ref_seq][1]
-        input_index = np.random.choice(np.arange(ref_start, ref_end), size=(self.num_images + 1,), replace=False)
+        query_index = np.random.choice(
+                np.arange(
+                    max(ref_start, ref_index - self.horizon * self.fps),
+                    min(ref_end, ref_index + self.horizon * self.fps)),
+                size=(1,),
+                replace=False)[0]
+        context_index = sorted(np.random.choice(
+                np.arange(
+                    ref_start,
+                    max(ref_start + self.num_images, ref_index - self.horizon * self.fps)),
+                size=(self.num_images,),
+                replace=False
+                ))
+        input_index = list(context_index) + [query_index]
         depth_frames = []
         all_filenames = []
         index_labels = []
