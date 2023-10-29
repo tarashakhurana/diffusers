@@ -4,6 +4,8 @@ import numpy as np
 
 from einops import repeat
 
+img2mse = lambda x, y : torch.mean((x - y) ** 2)
+mse2psnr = lambda x : -10. * torch.log(x) / torch.log(torch.Tensor([10.]))
 
 def encode_plucker(ray_origins, ray_dirs, harmonic_embedding=None):
     """
@@ -275,6 +277,11 @@ def get_plucker(K, Rt, H, W, return_image_plane=False, depth=None):
 def topk_l1_error(pd, gt):
     l1_error = torch.mean(torch.abs(pd - gt), (1, 2, 3))
     return min(l1_error)
+
+
+def topk_psnr(pd, gt):
+    psnrs = [mse2psnr(img2mse(pd[i], gt[i])) for i in range(pd.shape[0])]
+    return max(psnrs)
 
 
 def topk_scaleshift_inv_l1_error(pd, gt):

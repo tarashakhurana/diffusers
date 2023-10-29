@@ -36,7 +36,7 @@ from diffusers.utils.import_utils import is_xformers_available
 
 import utils
 from utils import HarmonicEmbedding, write_pointcloud
-from data import DebugDataset, TAOMAEDataset, TAOTemporalSuperResolutionDataset, OccfusionDataset, collate_fn_depthpose, collate_fn_inpainting, collate_fn_temporalsuperres
+from data import TAOMAEDataset, TAOTemporalSuperResolutionDataset, OccfusionDataset, collate_fn_depthpose, collate_fn_inpainting, collate_fn_temporalsuperres
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.16.0.dev0")
@@ -128,6 +128,12 @@ def parse_args():
         type=int,
         default=15,
         help="Number of frames in the original video after which a frame should be picked.",
+    )
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=30,
+        help="Framerate of the video.",
     )
     parser.add_argument(
         "--normalization_factor",
@@ -546,7 +552,6 @@ def main(args):
         model = UNetModel.from_config(config)
 
     print("Total number of parameters in model", model.num_parameters(only_trainable=True))
-    print(summary(model))
 
     # Create EMA for the model.
     if args.use_ema:
@@ -613,13 +618,25 @@ def main(args):
         use_harmonic=args.use_harmonic,
         visualize=args.visualize_dataloader
     )
-    """
     dataset = TAOMAEDataset(
         instance_data_root=args.train_data_dir,
         size=args.resolution,
         center_crop=args.center_crop,
         num_images=args.num_images,
         fps=args.fps,
+        split="train",
+        normalization_factor=args.normalization_factor,
+        visualize=args.visualize_dataloader
+    )
+    """
+    dataset = TAOForecastingDataset(
+        instance_data_root=args.train_data_dir,
+        size=args.resolution,
+        center_crop=args.center_crop,
+        num_images=args.num_images,
+        fps=args.fps,
+        horizon=1,
+        offset=15,
         split="train",
         normalization_factor=args.normalization_factor,
         visualize=args.visualize_dataloader
@@ -645,7 +662,7 @@ def main(args):
 
     train_dataloader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=1,
+        batch_size=args.train_batch_size,
         shuffle=True,
         collate_fn=collate_fn,
         num_workers=args.dataloader_num_workers,
@@ -804,7 +821,7 @@ def main(args):
 
             elif args.masking_strategy == "custom":
                 # if custom masking strategy then time indices should be specified for the entire batch
-                time_indices = torch.Tensor([args.num_images])
+                time_indices = torch.Tensor([args.num_images]).int()
                 mask_images = torch.zeros_like(clean_images[:, :, 0, :, :]) # 4d
                 mask_images[:, time_indices, ...] = torch.ones_like(clean_images[:, time_indices, 0, ...])
                 clean_depths_masked = clean_depths * (1 - mask_images)
@@ -821,7 +838,7 @@ def main(args):
                 """
 
                 model_inputs = torch.cat([
-                    noisy_images.reshape(B, T*C, H, W),
+                noisy_images.reshape(B, T*C, H, W),
                     clean_images_masked,
                     mask_images.reshape(B, T, H, W)], dim=1)
 
@@ -843,11 +860,13 @@ def main(args):
 
                 if args.loss_only_on_masked:
                     loss_indices = time_indices
+                    less_loss_indices = torch.Tensor([i for i in range(args.n_input + args.n_output) if i not in time_indices]).int()
                     """
                     model_output = model_output.reshape(B*T, H, W)
                     noise = noise.reshape(B*T, H, W)
                     """
                 else:
+                    assert args.loss_only_on_masked
                     loss_indices = torch.arange(model_output.shape[1]).int()
                     """
                     loss_indices = torch.arange(model_output.shape[0]).int()
@@ -874,6 +893,7 @@ def main(args):
                 if args.loss_in_2d:
                     if args.prediction_type == "epsilon":
                         loss_2d = F.mse_loss(model_output[:, loss_indices, ...], noise[:, loss_indices, ...])  # this could have different weights!
+                        loss_2d_less = F.mse_loss(model_output[:, less_loss_indices, ...], noise[:, less_loss_indices, ...])
                     elif args.prediction_type == "sample":
                         alpha_t = _extract_into_tensor(
                             noise_scheduler.alphas_cumprod, timesteps, (clean_depths.shape[0], 1, 1, 1)
@@ -883,6 +903,7 @@ def main(args):
                                 model_output[:, loss_indices, ...], clean_depths[:, loss_indices, ...], reduction="none"
                         )  # use SNR weighting from distillation paper
                         loss_2d = loss_val.mean()
+                        assert args.prediction_type == "epsilon"
                     else:
                         raise ValueError(f"Unsupported prediction type: {args.prediction_type}")
                 else:
@@ -905,7 +926,7 @@ def main(args):
 
                         plt.show()
 
-                loss = loss_2d
+                loss = (2.0 * loss_2d + loss_2d_less) / 3
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:

@@ -5,14 +5,14 @@ import torch
 import inspect
 import argparse
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 from torchvision import transforms
-from diffusers import DDPMPipeline, DDPMDepthPoseInpaintingPipeline, DDPMInpaintingPipeline, DDPMReconstructionPipeline
+from diffusers import DDPMPipeline, DDPMDepthPoseInpaintingPipeline, DDPMInpaintingPipeline, DDPMReconstructionPipeline, DDPMImg2ImgPipeline
 from diffusers import DPMSolverMultistepScheduler, UNet2DModel, UNet2DConditionRenderModel, DDPMScheduler, DDIMScheduler, DDPMConditioningScheduler
 import matplotlib.cm
 
 import utils
-from data import DebugDataset, OccfusionDataset, collate_fn_depthpose, collate_fn_inpainting, TAOTemporalSuperResolutionDataset, collate_fn_temporalsuperres
+from data import TAOMAEDataset, TAOForecastingDataset, OccfusionDataset, collate_fn_depthpose, collate_fn_inpainting, TAOTemporalSuperResolutionDataset, collate_fn_temporalsuperres
 from utils import render_path_spiral, write_pointcloud
 
 
@@ -157,6 +157,21 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--data_format",
+        type=str,
+        default="d",
+        choices=["d", "rgb", "rgbd"],
+        help="Whether the model should predict the 'epsilon'/noise error or directly the reconstructed image 'x0'.",
+    )
+    parser.add_argument(
+        "--eval_rgb_data_dir",
+        type=str,
+        default="/data/tkhurana/datasets/pointodyssey/val/",
+        help=(
+            "Path to the eval data directory"
+        ),
+    )
+    parser.add_argument(
         "--use_harmonic",
         default=False,
         action="store_true",
@@ -204,7 +219,7 @@ def parse_args():
         "--model_type",
         type=str,
         default="depthpose",
-        choices=["reconstruction", "inpainting", "depthpose"],
+        choices=["reconstruction", "inpainting", "depthpose", "img2img"],
         help="Whether the model should predict the 'epsilon'/noise error or directly the reconstructed image 'x0'.",
     )
     parser.add_argument("--ddpm_num_steps", type=int, default=1000)
@@ -224,8 +239,15 @@ def parse_args():
 
 
 def main(args):
+    load_rgb = False
+    rgb_data_root = None
+
+    if "rgb" in args.data_format:
+        load_rgb = True
+        rgb_data_root = args.eval_rgb_data_dir
+
     # Initialize the UNet2D
-    Scheduler = DDIMScheduler  # DDPMConditioningScheduler
+    Scheduler = DDPMScheduler  # DDPMConditioningScheduler
     if args.use_rendering:
         assert args.train_with_plucker_coords
         # assert args.prediction_type == "sample"
@@ -250,14 +272,27 @@ def main(args):
         visualize=True,
         spiral_poses=args.visualize_spiral,
     )
-    """
-    dataset = DebugDataset(
+    dataset = TAOMAEDataset(
         instance_data_root=args.eval_data_dir,
         size=args.resolution,
         center_crop=args.center_crop,
         num_images=args.num_images,
-        offset=args.offset,
         split="val",
+        normalization_factor=args.normalization_factor,
+        visualize=False
+    )
+    """
+    dataset = TAOForecastingDataset(
+        instance_data_root=args.eval_data_dir,
+        size=args.resolution,
+        center_crop=args.center_crop,
+        num_images=args.num_images,
+        fps=30,
+        horizon=1,
+        offset=15,
+        split="val",
+        load_rgb=load_rgb,
+        rgb_data_root=rgb_data_root,
         normalization_factor=args.normalization_factor,
         visualize=False
     )
@@ -278,7 +313,7 @@ def main(args):
 
     if args.model_type == "inpainting" or args.model_type == "reconstruction":
         collate_fn = collate_fn_inpainting
-    elif args.model_type == "depthpose":
+    elif args.model_type == "depthpose" or args.model_type == "img2img":
         collate_fn = collate_fn_depthpose
 
     eval_dataloader = torch.utils.data.DataLoader(
@@ -321,6 +356,15 @@ def main(args):
         kwargs["train_with_plucker_coords"] = args.train_with_plucker_coords
         kwargs["use_rendering"] = args.use_rendering
         pipeline = DDPMDepthPoseInpaintingPipeline(unet=unet, scheduler=noise_scheduler, kwargs=kwargs)
+    elif args.model_type == "img2img":
+        kwargs = {}
+        kwargs["n_input"] = args.n_input
+        kwargs["n_output"] = args.n_output
+        kwargs["masking_strategy"] = args.masking_strategy
+        kwargs["train_with_plucker_coords"] = args.train_with_plucker_coords
+        kwargs["use_rendering"] = args.use_rendering
+        kwargs["data_format"] = args.data_format
+        pipeline = DDPMImg2ImgPipeline(unet=unet, scheduler=noise_scheduler, kwargs=kwargs)
 
     generator = torch.Generator(device=pipeline.device).manual_seed(0)
     # run pipeline in inference (sample random noise and denoise)
@@ -333,6 +377,7 @@ def main(args):
         #     continue
 
         data_point = batch["input"].to("cuda:0")
+        data_point = data_point[:, :, None, :, :]
 
         if args.train_with_plucker_coords:
             plucker = batch["plucker_coords"].to("cuda:0")
@@ -342,12 +387,24 @@ def main(args):
             # ray_direction = batch["ray_direction"]
             # cam_coords = batch["cam_coords"]
 
+        if load_rgb:
+            rgb_images = batch["rgb_input"].to("cuda:0")  # shape: B T C H W
+
+        if args.data_format == "d":
+            data_point = data_point
+        elif args.data_format == "rgb":
+            data_point = rgb_images
+        elif args.data_format == "rgbd":
+            data_point = torch.cat([rgb_images, data_point], dim=2)
+
+        B, T, C, H, W = data_point.shape
+
         total_frames = data_point.shape[1]
         past_frames = torch.stack([data_point[0, :int(total_frames / 2), ...]] * 1)
         future_frames = torch.stack([data_point[0, int(total_frames / 2):, ...]] * 1)
         data_point = torch.stack([data_point[0, ...]] * 4)
         plucker = torch.stack([plucker[0, ...]] * 4)
-        plucker[:, 3:4, :] = plucker[:, 3:4, :] + torch.arange(4)[:, None, None].to("cuda:0")
+        plucker[:, 3:4, :] = plucker[:, 3:4, :] + (torch.arange(4)[:, None, None].to("cuda:0") - 2)
         batch_size = 4
         print("data point and plucker shape", data_point.shape, plucker.shape)
 
@@ -393,9 +450,30 @@ def main(args):
                     user_time_indices=time_indices,
                 ).images
             masked_indices = np.array([i for i in range(args.n_input + args.n_output) if i not in unmasked_indices.tolist()])
+        elif args.model_type == "img2img":
+            print("getting predictions using args.num_masks", args.num_masks)
+            prediction, _ = pipeline(
+                    inpainting_image=(data_point, plucker),
+                    batch_size=batch_size,
+                    num_inference_steps=args.num_inference_steps,
+                    output_type="numpy",
+                    user_num_masks=args.num_masks,
+                    user_time_indices=time_indices,
+                ).images
+
 
         prediction = torch.from_numpy(prediction).permute(0, 3, 1, 2)
-        B, T, H, W = prediction.shape
+
+        if not args.model_type == "img2img":
+            prediction = prediction[:, :, None, :, :]
+        else:
+            prediction = prediction.reshape(batch_size, 1, C, H, W)
+            data_point_minmax = data_point[:, :args.num_images, :, :, :].cpu()
+            data_point_minmax = torch.clamp((data_point_minmax / 2 + 0.5), 0, 1)
+            prediction = torch.cat([data_point_minmax, prediction], axis=1)
+            masked_indices = [args.num_images]
+
+        B, T, C, H, W = prediction.shape
 
         if args.visualize_3d:
             all_points = []
@@ -404,20 +482,32 @@ def main(args):
             i = 0
 
         batch_colored_images = {0: [], 1: [], 2: [], 3: []}
+        batch_colored_rgb_images = {0: [], 1: [], 2: [], 3: []}
 
         for b in range(prediction.shape[0]):
             count += 1
             spiral = []
             colored_images = []
+            colored_rgb_images = []
             for framenumber in range(prediction.shape[1]):
-                prediction_minmax = (prediction[b, framenumber] - prediction[b, framenumber].min()) / (prediction[b, framenumber].max() - prediction[b, framenumber].min())
-                if framenumber in masked_indices:
-                    cmap = matplotlib.cm.get_cmap('inferno')
-                else:
-                    cmap = matplotlib.cm.get_cmap('gray')
-                colored_image = cmap(prediction_minmax)
-                colored_images.append(Image.fromarray((colored_image * 255).astype(np.uint8)))
-                batch_colored_images[b].append(Image.fromarray((colored_image * 255).astype(np.uint8)))
+
+                if "d" in args.data_format:
+                    prediction_minmax = (prediction[b, framenumber, -1] - prediction[b, framenumber, -1].min()) / (prediction[b, framenumber, -1].max() - prediction[b, framenumber, -1].min())
+                    if framenumber in masked_indices:
+                        cmap = matplotlib.cm.get_cmap('inferno')
+                    else:
+                        cmap = matplotlib.cm.get_cmap('gray')
+                    colored_image = cmap(prediction_minmax)
+                    colored_images.append(Image.fromarray((colored_image * 255).astype(np.uint8)))
+                    batch_colored_images[b].append(Image.fromarray((colored_image * 255).astype(np.uint8)))
+
+                if "rgb" in args.data_format:
+                    prediction_minmax = prediction[b, framenumber, :3].permute(1, 2, 0).numpy()[:, :, ::-1]
+                    colored_rgb_image = Image.fromarray((prediction_minmax * 255).astype(np.uint8))
+                    # if framenumber not in masked_indices:
+                    #     colored_rgb_image = ImageOps.grayscale(colored_rgb_image)
+                    colored_rgb_images.append(colored_rgb_image)
+                    batch_colored_rgb_images[b].append(colored_rgb_image)
 
                 if args.visualize_3d:
                     ro = ray_origin[b, framenumber, ...].numpy().reshape(1, 3)
@@ -467,29 +557,51 @@ def main(args):
                 all_points = np.concatenate(all_points, axis=0)
                 all_colors = np.concatenate(all_colors, axis=0)
                 all_edges = np.stack(all_edges, axis=0)
-                write_pointcloud(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals_constnoise_ddim/3d_{count}.ply", all_points, all_colors, edges=all_edges)
+                write_pointcloud(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals_ddpm/3d_{count}.ply", all_points, all_colors, edges=all_edges)
 
-            os.makedirs(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals_constnoise_ddim", exist_ok=True)
-            utils.make_gif(colored_images, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals_constnoise_ddim/2d_{count}.gif", duration=800)
+            if "d" in args.data_format:
+                os.makedirs(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/train_visuals_ddpm", exist_ok=True)
+                utils.make_gif(colored_images, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/train_visuals_ddpm/2d_{count}.gif", duration=800)
 
-        batch_colored_images_toplot = []
-        widths, heights = zip(*(i.size for i in batch_colored_images[0]))
-        total_width = sum(widths[:4])
-        max_height = max(heights)
+            if "rgb" in args.data_format:
+                os.makedirs(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/train_visuals_rgb_ddpm", exist_ok=True)
+                utils.make_gif(colored_rgb_images, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/train_visuals_rgb_ddpm/2d_{count}.gif", duration=800)
 
-        for i in range(len(batch_colored_images[0])):
-            x_offset = 0
-            new_im = Image.new('RGB', (total_width, max_height))
-            for b in range(prediction.shape[0]):
-                new_im.paste(batch_colored_images[b][i], (x_offset,0))
-                x_offset += batch_colored_images[b][i].size[0]
-            batch_colored_images_toplot.append(new_im)
+        if "d" in args.data_format:
+            batch_colored_images_toplot = []
+            widths, heights = zip(*(i.size for i in batch_colored_images[0]))
+            total_width = sum(widths[:4])
+            max_height = max(heights)
 
-        utils.make_gif(batch_colored_images_toplot, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals_constnoise_ddim/batch_2d_{count}.gif", duration=800)
+            for i in range(len(batch_colored_images[0])):
+                x_offset = 0
+                new_im = Image.new('RGB', (total_width, max_height))
+                for b in range(prediction.shape[0]):
+                    new_im.paste(batch_colored_images[b][i], (x_offset,0))
+                    x_offset += batch_colored_images[b][i].size[0]
+                batch_colored_images_toplot.append(new_im)
+
+            utils.make_gif(batch_colored_images_toplot, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/train_visuals_ddpm/batch_2d_{count}.gif", duration=800)
+
+        if "rgb" in args.data_format:
+            batch_colored_rgb_images_toplot = []
+            widths, heights = zip(*(i.size for i in batch_colored_rgb_images[0]))
+            total_width = sum(widths[:4])
+            max_height = max(heights)
+
+            for i in range(len(batch_colored_rgb_images[0])):
+                x_offset = 0
+                new_im = Image.new('RGB', (total_width, max_height))
+                for b in range(prediction.shape[0]):
+                    new_im.paste(batch_colored_rgb_images[b][i], (x_offset,0))
+                    x_offset += batch_colored_rgb_images[b][i].size[0]
+                batch_colored_rgb_images_toplot.append(new_im)
+
+            utils.make_gif(batch_colored_rgb_images_toplot, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/train_visuals_rgb_ddpm/batch_2d_{count}.gif", duration=800)
 
         if args.visualize_spiral:
             spiral.append(colored_images[6])
-            utils.make_gif(spiral, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals_constnoise_ddim/spiral_{count}.gif", duration=800)
+            utils.make_gif(spiral, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals_ddpm/spiral_{count}.gif", duration=800)
 
 
 if __name__ == "__main__":
