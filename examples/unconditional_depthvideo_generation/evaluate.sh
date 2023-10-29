@@ -1,14 +1,16 @@
 python evaluate.py \
-    --model_dir /data3/tkhurana/diffusers/logs/TAO-depth_minitrain_custom-masking_resolution-64_stdunetwithcrossattn_predictonlyonearbitraryfuture/ \
-    --checkpoint_number 7000 \
-    --model_type depthpose \
-    --eval_data_dir /data/tkhurana/TAO-depth/zoe/frames/minitrain/ \
+    --model_dir /data3/tkhurana/diffusers/logs/TAO-rgb_val_img2img_resolution-64_stdunetwithcrossattn_singlestepprediction_randomsequence_2shorizon_startfromSD_finetuneverything/ \
+    --checkpoint_number 5000 \
+    --model_type img2img \
+    --eval_data_dir /data/tkhurana/TAO-depth/zoe/frames/train/ \
+    --eval_rgb_data_dir /data3/chengyeh/TAO/frames/train/ \
     --train_with_plucker_coords \
     --use_rendering \
     --in_channels 12 \
-    --out_channels 4 \
+    --out_channels 3 \
     --n_input 3 \
     --n_output 1 \
     --num_images 3 \
+    --data_format rgb \
     --normalization_factor 20480.0 \
     --masking_strategy random

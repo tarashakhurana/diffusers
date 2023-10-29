@@ -264,6 +264,28 @@ def collate_fn_depthpose(examples):
 
     filenames = [example["filenames"] for example in examples]
 
+    if "interp_depth" in examples[0]:
+        interp_depth = torch.stack([example["interp_depth"] for example in examples])
+        interp_depth = interp_depth.to(memory_format=torch.contiguous_format).float()
+        return {
+            "input": inputs,
+            "plucker_coords": plucker_coords,
+            "interp_depth": interp_depth,
+            "filenames": filenames
+        }
+
+    # interp depth should never be asked for alongside rgb input so its okay to
+    # return with only rgb input here
+    if "rgb_input" in examples[0]:
+        rgb_input = torch.stack([example["rgb_input"] for example in examples])
+        rgb_input = rgb_input.to(memory_format=torch.contiguous_format).float()
+        return {
+            "input": inputs,
+            "plucker_coords": plucker_coords,
+            "rgb_input": rgb_input,
+            "filenames": filenames
+        }
+
     return {
         "input": inputs,
         "plucker_coords": plucker_coords,
@@ -914,23 +936,31 @@ class TAOMAEDataset(Dataset):
     def __init__(
         self,
         instance_data_root,
+        load_rgb=False,
+        rgb_data_root=None,
         size=256,
         num_images=3,
         split="train",
         ext=["png"],
-        horizon=3,
+        horizon=1,
         center_crop=True,
+        window_horizon=0.5,
         fps=30,
         interpolation_baseline=False,
         normalization_factor=20480.0,
         visualize=False,
     ):
+        if load_rgb:
+            assert rgb_data_root is not None
         self.size = size
         self.center_crop = center_crop
         self.num_images = num_images
         self.split = split
         self.fps = fps
+        self.load_rgb = load_rgb
+        self.rgb_data_root = rgb_data_root
         self.horizon = horizon
+        self.window_horizon = window_horizon
         self.visualize = visualize
         self.interpolation_baseline = interpolation_baseline
         self.normalization_factor = normalization_factor
@@ -946,6 +976,8 @@ class TAOMAEDataset(Dataset):
         all_frames = []
         seq_to_frames = {}
         self.seq_to_startend = {}
+        if self.load_rgb:
+            self.rgb_filenames = []
 
         for e in ext:
             all_frames.extend(sorted(list(self.instance_data_root.rglob(f"*.{e}"))))
@@ -968,14 +1000,27 @@ class TAOMAEDataset(Dataset):
                 frame_path = frames[idx]
                 self.sequences.append(seq)
                 self.filenames.append(frame_path)
+                if self.load_rgb:
+                    rgb_path = str(self.rgb_data_root) + str(frame_path)[len(str(self.instance_data_root)):-4] + ".jpg"
+                    self.rgb_filenames.append(rgb_path)
 
             #
             end_index = len(self.filenames)
             #
-            valid_start_index = start_index + self.horizon * self.fps * 2
-            valid_end_index = end_index - self.horizon * self.fps * 2
+            if self.split == "train":
+                valid_start_index = start_index + self.horizon * self.fps * 2
+                valid_end_index = end_index - self.horizon * self.fps * 2
+            elif self.split == "val":
+                valid_start_index = np.random.choice(
+                        np.arange(
+                            start_index + self.horizon * self.fps * 2,
+                            end_index - self.horizon * self.fps * 2),
+                        size=(1,),
+                        replace=False
+                    )[0]
+                valid_end_index = valid_start_index + 1
             self.seq_to_startend[seq] = (valid_start_index, valid_end_index)
-            self.valid_indices += list(range(valid_start_index, valid_end_index))
+            self.valid_indices += list(range(valid_start_index, valid_end_index, int(self.window_horizon * self.fps)))
 
         self.num_instance_images = len(self.valid_indices)
         self._length = self.num_instance_images
@@ -1008,6 +1053,12 @@ class TAOMAEDataset(Dataset):
                 size=(self.num_images + 1,),
                 replace=False)
         """
+        query_index = np.random.choice(
+                np.arange(
+                    max(ref_start - self.horizon * self.fps, ref_index - self.horizon * self.fps),
+                    min(ref_end + self.horizon * self.fps, ref_index + self.horizon * self.fps)),
+                size=(1,),
+                replace=False)[0]
         context_index = sorted(np.random.choice(
                 np.arange(
                     max(ref_start - self.horizon * self.fps, ref_index - self.horizon * self.fps),
@@ -1023,6 +1074,8 @@ class TAOMAEDataset(Dataset):
         # input_index = list(context_index) + [query_index]
         input_index = query_index
         depth_frames = []
+        if self.load_rgb:
+            rgb_frames = []
         all_filenames = []
         index_labels = []
 
@@ -1043,12 +1096,19 @@ class TAOMAEDataset(Dataset):
             depth_preprocessed = self.image_transforms(Image.fromarray(depth.astype("uint8"))).squeeze()
             depth_frames.append(depth_preprocessed)
 
+            if self.load_rgb:
+                rgb = cv2.imread(str(self.rgb_filenames[query_index]), 0)
+                rgb_preprocessed = self.image_transforms(Image.fromarray(rgb)).squeeze()
+                rgb_frames.append(rgb_preprocessed.unsqueeze(0))
+
             index_label = torch.Tensor([i - input_index[self.num_images-1]]) / self.fps
 
             index_labels.append(index_label)
 
         depth_video = torch.stack(depth_frames, axis=0)
         label_video = torch.stack(index_labels, axis=0)
+        if self.load_rgb:
+            rgb_video = torch.stack(rgb_frames, axis=0)
 
         if self.interpolation_baseline:
             xx, yy = np.meshgrid(np.arange(self.resolution), np.arange(self.resolution))
@@ -1088,8 +1148,212 @@ class TAOMAEDataset(Dataset):
         example["plucker_coords"] = label_video
         if self.interpolation_baseline:
             example["interp_depth"] = interp_depth
+        if self.load_rgb:
+            example["rgb_input"] = rgb_video
 
         return example
+
+
+class TAOForecastingDataset(Dataset):
+    """
+    A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
+    It pre-processes the images and the tokenizes prompts.
+    """
+
+    def __init__(
+        self,
+        instance_data_root,
+        load_rgb=False,
+        rgb_data_root=None,
+        size=256,
+        num_images=3,
+        split="train",
+        ext=["png"],
+        offset=15,
+        fps=30,
+        horizon=1,
+        center_crop=True,
+        interpolation_baseline=False,
+        normalization_factor=20480.0,
+        visualize=False,
+    ):
+        if load_rgb:
+            assert rgb_data_root is not None
+
+        self.size = size
+        self.center_crop = center_crop
+        self.num_images = num_images
+        self.split = split
+        self.fps = fps
+        self.load_rgb = load_rgb
+        self.rgb_data_root = rgb_data_root
+        self.offset = offset
+        self.horizon = horizon
+        self.visualize = visualize
+        self.interpolation_baseline = interpolation_baseline
+        self.normalization_factor = normalization_factor
+
+        self.instance_data_root = Path(instance_data_root)
+        if not self.instance_data_root.exists():
+            raise ValueError(f"Instance {self.instance_data_root} images root doesn't exists.")
+
+        # NOTE:
+        self.sequences = []
+        self.filenames = []
+        self.valid_indices = []
+        all_frames = []
+        seq_to_frames = {}
+        self.seq_to_startend = {}
+        if self.load_rgb:
+            self.rgb_filenames = []
+
+        for e in ext:
+            all_frames.extend(sorted(list(self.instance_data_root.rglob(f"*.{e}"))))
+
+        all_frames = list(all_frames)
+
+        self.paths = all_frames
+
+        for frame in all_frames:
+            seq = str(frame)[len(str(self.instance_data_root)) + 1:str(frame).rfind("/")]
+            if seq not in seq_to_frames:
+                seq_to_frames[seq] = []
+            seq_to_frames[seq].append(frame)
+
+        for seq in seq_to_frames:
+            frames = seq_to_frames[seq]
+            start_index = len(self.filenames)
+
+            for idx in range(0, len(frames), self.offset):
+                frame_path = frames[idx]
+                self.sequences.append(seq)
+                self.filenames.append(frame_path)
+                if self.load_rgb:
+                    rgb_path = str(self.rgb_data_root) + str(frame_path)[len(str(self.instance_data_root)):-4] + ".jpg"
+                    self.rgb_filenames.append(rgb_path)
+
+            #
+            end_index = len(self.filenames)
+
+            #
+            if self.split == "train":
+                valid_start_index = start_index + int(self.horizon * self.fps / self.offset)
+                valid_end_index = end_index - int(self.horizon * self.fps / self.offset)
+            elif self.split == "val":
+                valid_start_index = np.random.choice(
+                        np.arange(
+                            start_index + int(self.horizon * self.fps / self.offset),
+                            end_index - int(self.horizon * self.fps / self.offset)),
+                        size=(1,),
+                        replace=False
+                    )[0]
+                valid_end_index = valid_start_index + 1
+            self.seq_to_startend[seq] = (valid_start_index, valid_end_index)
+            self.valid_indices += list(range(valid_start_index, valid_end_index))
+
+        self.num_instance_images = len(self.valid_indices)
+        self._length = self.num_instance_images
+
+        print("found length to be", self._length)
+
+        self.image_transforms = transforms.Compose(
+            [
+                transforms.Resize(size, interpolation=transforms.InterpolationMode.NEAREST),
+                transforms.CenterCrop(size),
+                transforms.ToTensor(),
+                # brings the training data between -1 and 1
+                transforms.Normalize([0.5], [0.5]),
+            ]
+        )
+
+    def __len__(self):
+        return self._length
+
+    def __getitem__(self, index):
+        example = {}
+        ref_index = self.valid_indices[index]
+        ref_seq = self.sequences[ref_index]
+        depth_frames = []
+        if self.load_rgb:
+            rgb_frames = []
+        all_filenames = []
+        index_labels = []
+
+        # take 3 images from the past + a future image
+        for i in list(range(self.num_images)) + [self.num_images + 1]:
+            query_index = int(ref_index - self.num_images + i + 1)
+
+            all_filenames.append(self.filenames[query_index])
+
+            curr_seq = self.sequences[query_index]
+            assert ref_seq == curr_seq
+
+            depth = cv2.imread(str(self.filenames[query_index]), cv2.IMREAD_ANYDEPTH)
+            depth = depth.astype(np.float32) / self.normalization_factor
+
+            # in TAO, we predicted per frame relative depth
+            depth = (depth - depth.min()) / (depth.max() - depth.min()) * 255.0
+
+            depth_preprocessed = self.image_transforms(Image.fromarray(depth.astype("uint8"))).squeeze()
+            depth_frames.append(depth_preprocessed)
+
+            if self.load_rgb:
+                rgb = cv2.imread(str(self.rgb_filenames[query_index]))
+                rgb_preprocessed = self.image_transforms(Image.fromarray(rgb)).squeeze()
+                rgb_frames.append(rgb_preprocessed)
+
+            index_label = torch.Tensor([query_index - ref_index]) / (self.fps / self.offset)
+
+            index_labels.append(index_label)
+
+        depth_video = torch.stack(depth_frames, axis=0)
+        label_video = torch.stack(index_labels, axis=0).squeeze()
+        if self.load_rgb:
+            rgb_video = torch.stack(rgb_frames, axis=0)
+
+        if self.interpolation_baseline:
+            xx, yy = np.meshgrid(np.arange(self.size), np.arange(self.size))
+            xx, yy = xx.reshape(-1), yy.reshape(-1)
+            query = np.stack([np.full_like(yy, label_video[-1]), yy, xx], axis=1)
+            interp_depth = interpn(
+                    (label_video[:self.num_images], np.arange(self.size), np.arange(self.size)),
+                    depth_video[:self.num_images],
+                    query,
+                    method='linear',
+                    fill_value=None,
+                    bounds_error=False)
+            interp_depth = np.clip(interp_depth, 0.0, 1.0)
+            interp_depth = interp_depth.reshape((self.size, self.size))
+
+        if self.visualize:
+            fig = plt.figure()
+            for j in range(self.num_images+1):
+                plt.subplot(1, self.num_images+1, j+1)
+                plt.imshow(depth_video[j].numpy())
+                plt.title(str(label_video[j]))
+            plt.show()
+            if self.interpolation_baseline:
+                fig = plt.figure()
+                for j in range(self.num_images+1):
+                    plt.subplot(1, self.num_images+1, j+1)
+                    if j == self.num_images:
+                        plt.imshow(interp_depth)
+                        plt.title("interp depth at", str(label_video[j]))
+                    else:
+                        plt.imshow(depth_video[j].numpy())
+                        plt.title(str(label_video[j]))
+                plt.show()
+
+        example["input"] = depth_video  # video is of shape T x H x W or T x C x H x W
+        example["filenames"] = all_filenames
+        example["plucker_coords"] = label_video.unsqueeze(-1)
+        if self.interpolation_baseline:
+            example["interp_depth"] = torch.from_numpy(interp_depth).unsqueeze(0)
+        if self.load_rgb:
+            example["rgb_input"] = rgb_video
+
+        return example
+
 
 
 class DeformingThing4DDataset(Dataset):
@@ -1522,16 +1786,16 @@ class TAOTemporalSuperResolutionDataset(Dataset):
 
 if __name__ == "__main__":
     dataset = TAOMAEDataset(
-        instance_data_root="../../../TAO-depth/frames/test/",
+        instance_data_root="/data/tkhurana/TAO-depth/zoe/frames/val/",
         size=64,
         center_crop=False,
         num_images=3,
+        load_rgb=True,
+        rgb_data_root="/data3/chengyeh/TAO/frames/val/",
         split="train",
         normalization_factor=20480.0,
-        visualize=True
+        visualize=False
     )
     for i in range(len(dataset)):
-        if i < 600:
-            continue
         print(dataset[i])
 

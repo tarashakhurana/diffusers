@@ -8,12 +8,12 @@ import numpy as np
 from prettytable import PrettyTable
 from PIL import Image
 from torchvision import transforms
-from diffusers import DDPMPipeline, DDPMDepthPoseInpaintingPipeline, DDPMInpaintingPipeline, DDPMReconstructionPipeline
+from diffusers import DDPMPipeline, DDPMDepthPoseInpaintingPipeline, DDPMInpaintingPipeline, DDPMReconstructionPipeline, DDPMImg2ImgPipeline
 from diffusers import DPMSolverMultistepScheduler, UNet2DModel, UNet2DConditionRenderModel, DDPMScheduler, DDIMScheduler, DDPMConditioningScheduler
 import matplotlib.cm
 
 import utils
-from data import DebugDataset, OccfusionDataset, collate_fn_depthpose, collate_fn_inpainting, TAOTemporalSuperResolutionDataset, collate_fn_temporalsuperres
+from data import TAOMAEDataset, TAOForecastingDataset, OccfusionDataset, collate_fn_depthpose, collate_fn_inpainting, TAOTemporalSuperResolutionDataset, collate_fn_temporalsuperres
 from utils import render_path_spiral, write_pointcloud
 
 
@@ -39,6 +39,14 @@ def parse_args():
     )
     parser.add_argument(
         "--eval_data_dir",
+        type=str,
+        default="/data/tkhurana/datasets/pointodyssey/val/",
+        help=(
+            "Path to the eval data directory"
+        ),
+    )
+    parser.add_argument(
+        "--eval_rgb_data_dir",
         type=str,
         default="/data/tkhurana/datasets/pointodyssey/val/",
         help=(
@@ -172,6 +180,12 @@ def parse_args():
         help="whether to randomly flip images horizontally",
     )
     parser.add_argument(
+        "--evaluate_interpolation",
+        default=False,
+        action="store_true",
+        help="whether to evaluate the interpolation baseline given by the dataloader",
+    )
+    parser.add_argument(
         "--dataloader_num_workers",
         type=int,
         default=0,
@@ -196,6 +210,13 @@ def parse_args():
         help="Whether the model should predict the 'epsilon'/noise error or directly the reconstructed image 'x0'.",
     )
     parser.add_argument(
+        "--data_format",
+        type=str,
+        default="d",
+        choices=["d", "rgb", "rgbd"],
+        help="Whether the model should predict the 'epsilon'/noise error or directly the reconstructed image 'x0'.",
+    )
+    parser.add_argument(
         "--masking_strategy",
         type=str,
         default="random",
@@ -205,7 +226,7 @@ def parse_args():
         "--model_type",
         type=str,
         default="depthpose",
-        choices=["reconstruction", "inpainting", "depthpose"],
+        choices=["reconstruction", "inpainting", "depthpose", "img2img"],
         help="Whether the model should predict the 'epsilon'/noise error or directly the reconstructed image 'x0'.",
     )
     parser.add_argument("--ddpm_num_steps", type=int, default=1000)
@@ -225,6 +246,13 @@ def parse_args():
 
 
 def main(args):
+    load_rgb = False
+    rgb_data_root = None
+
+    if "rgb" in args.data_format:
+        load_rgb = True
+        rgb_data_root = args.eval_rgb_data_dir
+
     # Initialize the UNet2D
     Scheduler = DDPMScheduler  # DDPMConditioningScheduler
     if args.use_rendering:
@@ -251,14 +279,30 @@ def main(args):
         visualize=True,
         spiral_poses=args.visualize_spiral,
     )
+    dataset = TAOMAEDataset(
+        instance_data_root=args.eval_data_dir,
+        load_rgb=load_rgb,
+        rgb_data_root=rgb_data_root,
+        size=args.resolution,
+        center_crop=args.center_crop,
+        num_images=args.num_images,
+        split="val",
+        normalization_factor=args.normalization_factor,
+        visualize=False
+    )
     """
-    dataset = DebugDataset(
+    dataset = TAOForecastingDataset(
         instance_data_root=args.eval_data_dir,
         size=args.resolution,
         center_crop=args.center_crop,
         num_images=args.num_images,
-        offset=args.offset,
+        fps=30,
+        horizon=1,
+        offset=15,
         split="val",
+        load_rgb=load_rgb,
+        rgb_data_root=rgb_data_root,
+        interpolation_baseline=args.evaluate_interpolation,
         normalization_factor=args.normalization_factor,
         visualize=False
     )
@@ -279,7 +323,7 @@ def main(args):
 
     if args.model_type == "inpainting" or args.model_type == "reconstruction":
         collate_fn = collate_fn_inpainting
-    elif args.model_type == "depthpose":
+    elif args.model_type == "depthpose" or args.model_type == "img2img":
         collate_fn = collate_fn_depthpose
 
     eval_dataloader = torch.utils.data.DataLoader(
@@ -322,22 +366,43 @@ def main(args):
         kwargs["train_with_plucker_coords"] = args.train_with_plucker_coords
         kwargs["use_rendering"] = args.use_rendering
         pipeline = DDPMDepthPoseInpaintingPipeline(unet=unet, scheduler=noise_scheduler, kwargs=kwargs)
+    elif args.model_type == "img2img":
+        kwargs = {}
+        kwargs["n_input"] = args.n_input
+        kwargs["n_output"] = args.n_output
+        kwargs["masking_strategy"] = args.masking_strategy
+        kwargs["train_with_plucker_coords"] = args.train_with_plucker_coords
+        kwargs["use_rendering"] = args.use_rendering
+        kwargs["data_format"] = args.data_format
+        pipeline = DDPMImg2ImgPipeline(unet=unet, scheduler=noise_scheduler, kwargs=kwargs)
 
     generator = torch.Generator(device=pipeline.device).manual_seed(0)
     # run pipeline in inference (sample random noise and denoise)
 
     top1_metric, top3_metric, top5_metric = 0, 0, 0
     top1_inv_metric, top3_inv_metric, top5_inv_metric = 0, 0, 0
+
+    top1_psnr, top3_psnr, top5_psnr = 0, 0, 0
+
     count = 0
 
-    headers = ['Top1', 'Top1 (inv)', 'Top3', 'Top3 (inv)', 'Top5', 'Top5 (inv)']
+    if not args.evaluate_interpolation:
+        headers = ['Top1', 'Top1 (inv)', 'Top3', 'Top3 (inv)', 'Top5', 'Top5 (inv)']
+    else:
+        headers = ['Top1', 'Top1 (inv)']
+
+    if load_rgb:
+        headers_rgb = ['Top1 PSNR', 'Top3 PSNR', 'Top5 PSNR']
+
+    # open the results file
+    resultsfile = open(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/results.txt", "w")
 
     for b, batch in enumerate(eval_dataloader):
 
-        # if b != 3:
-        #     continue
+        print(f"Doing {b}/{len(eval_dataloader)}")
 
-        data_point = batch["input"].to("cuda:0")
+        data_point = batch["input"].to("cuda:0")  # shape: B T H W
+        data_point = data_point[:, :, None, :, :]  # shape: B T C H W
 
         if args.train_with_plucker_coords:
             plucker = batch["plucker_coords"].to("cuda:0")
@@ -347,79 +412,157 @@ def main(args):
             # ray_direction = batch["ray_direction"]
             # cam_coords = batch["cam_coords"]
 
-        total_frames = data_point.shape[1]
-        past_frames = torch.stack([data_point[0, :int(total_frames / 2), ...]] * 1)
-        future_frames = torch.stack([data_point[0, int(total_frames / 2):, ...]] * 1)
-        data_point = torch.stack([data_point[0, ...]] * 5)
-        plucker = torch.stack([plucker[0, ...]] * 5)
-        print("data point and plucker shape", data_point.shape, plucker.shape)
+        if load_rgb:
+            rgb_images = batch["rgb_input"].to("cuda:0")  # shape: B T C H W
 
-        time_indices = torch.Tensor([3]).int() # [0,1,2,3,4,5,7,8,9,10,11]
-        args.num_masks = 1  # 11
-        batch_size = 5
+        if args.data_format == "d":
+            data_point = data_point
+        elif args.data_format == "rgb":
+            data_point = rgb_images
+        elif args.data_format == "rgbd":
+            data_point = torch.cat([rgb_images, data_point], dim=2)
 
-        if args.model_type == "reconstruction":
-            prediction = pipeline(
-                    batch_size=batch_size,
-                    num_inference_steps=args.num_inference_steps,
-                    cond_inds=torch.arange(int(total_frames / 2)),
-                    recon_scale=10,
-                    conditioning=past_frames,
-                    output_type="numpy").images
-        elif args.model_type == "inpainting":
-            prediction, unmasked_indices = pipeline(
-                    inpainting_image=data_point,
-                    batch_size=batch_size,
-                    num_inference_steps=args.num_inference_steps,
-                    output_type="numpy",
-                    user_num_masks=args.num_masks,
-                    user_time_indices=time_indices).images
-            masked_indices = np.array([i for i in range(args.n_input + args.n_output) if i not in unmasked_indices.tolist()])
-        elif args.model_type == "depthpose":
-            print("getting predictions using args.num_masks", args.num_masks)
-            prediction, unmasked_indices = pipeline(
-                    inpainting_image=(data_point, plucker),
-                    batch_size=batch_size,
-                    num_inference_steps=args.num_inference_steps,
-                    output_type="numpy",
-                    user_num_masks=args.num_masks,
-                    user_time_indices=time_indices,
-                ).images
-            masked_indices = np.array([i for i in range(args.n_input + args.n_output) if i not in unmasked_indices.tolist()])
+        B, T, C, H, W = data_point.shape
 
-        prediction = torch.from_numpy(prediction).permute(0, 3, 1, 2)
-        B, T, H, W = prediction.shape
+        if not args.evaluate_interpolation:
+            total_frames = data_point.shape[1]
+            past_frames = torch.stack([data_point[0, :int(total_frames / 2), ...]] * 1)
+            future_frames = torch.stack([data_point[0, int(total_frames / 2):, ...]] * 1)
+            data_point = torch.stack([data_point[0, ...]] * 5)
+            plucker = torch.stack([plucker[0, ...]] * 5)
+            B, T, C, H, W = data_point.shape
+
+            time_indices = torch.Tensor([3]).int() # [0,1,2,3,4,5,7,8,9,10,11]
+            args.num_masks = 1  # 11
+            batch_size = 5
+
+            if args.model_type == "reconstruction":
+                prediction = pipeline(
+                        batch_size=batch_size,
+                        num_inference_steps=args.num_inference_steps,
+                        cond_inds=torch.arange(int(total_frames / 2)),
+                        recon_scale=10,
+                        conditioning=past_frames,
+                        output_type="numpy").images
+            elif args.model_type == "inpainting":
+                prediction, unmasked_indices = pipeline(
+                        inpainting_image=data_point.squeeze(),
+                        batch_size=batch_size,
+                        num_inference_steps=args.num_inference_steps,
+                        output_type="numpy",
+                        user_num_masks=args.num_masks,
+                        user_time_indices=time_indices).images
+                masked_indices = np.array([i for i in range(args.n_input + args.n_output) if i not in unmasked_indices.tolist()])
+            elif args.model_type == "depthpose":
+                print("getting predictions using args.num_masks", args.num_masks)
+                prediction, unmasked_indices = pipeline(
+                        inpainting_image=(data_point, plucker),
+                        batch_size=batch_size,
+                        num_inference_steps=args.num_inference_steps,
+                        output_type="numpy",
+                        user_num_masks=args.num_masks,
+                        user_time_indices=time_indices,
+                    ).images
+                masked_indices = np.array([i for i in range(args.n_input + args.n_output) if i not in unmasked_indices.tolist()])
+            elif args.model_type == "img2img":
+                print("getting predictions using args.num_masks", args.num_masks)
+                prediction, _ = pipeline(
+                        inpainting_image=(data_point, plucker),
+                        batch_size=batch_size,
+                        num_inference_steps=args.num_inference_steps,
+                        output_type="numpy",
+                        user_num_masks=args.num_masks,
+                        user_time_indices=time_indices,
+                    ).images
+
+                prediction = torch.from_numpy(prediction).permute(0, 3, 1, 2)
+
+        else:
+            prediction = batch["interp_depth"]
+            masked_indices = np.array([0])
+
+        if not args.model_type == "img2img":
+            prediction = prediction[:, :, None, :, :]
+        else:
+            prediction = prediction.reshape(B, 1, C, H, W)
+            prediction = torch.cat([data_point[:, :args.num_images, :, :, :].cpu(), prediction], axis=1)
+            masked_indices = [args.num_images]
+
+        B, T, C, H, W = prediction.shape
         count += 1
 
-
-        assert data_point.ndim == 4
+        if args.model_type == "img2img":
+            assert data_point.ndim == 5
+        else:
+            assert data_point.ndim == 4
         groundtruth = data_point.cpu()
+
+        # open the results file
+        resultsfile = open(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/results.txt", "w")
 
         # shapes of prediction are batch x frames x height x width
         # shapes of groundtruth is the same
         # but now we need to find top 1 and top 3 numbers
         # we will compute both the normal and scale/shift invariant loss
-        top1_prediction = prediction[:1, masked_indices, ...]
-        top1_groundtruth = groundtruth[:1, masked_indices, ...]
-        top1_metric += utils.topk_l1_error(top1_prediction, top1_groundtruth)
-        top1_inv_metric += utils.topk_scaleshift_inv_l1_error(top1_prediction, top1_groundtruth)
+        if "d" in args.data_format:
+            top1_prediction = prediction[:1, masked_indices, -1, ...]
+            top1_groundtruth = groundtruth[:1, masked_indices, -1, ...]
 
-        top3_prediction = prediction[:3, masked_indices, ...]
-        top3_groundtruth = groundtruth[:3, masked_indices, ...]
-        top3_metric += utils.topk_l1_error(top3_prediction, top3_groundtruth)
-        top3_inv_metric += utils.topk_scaleshift_inv_l1_error(top3_prediction, top3_groundtruth)
+            top1_metric += utils.topk_l1_error(top1_prediction, top1_groundtruth)
+            top1_inv_metric += utils.topk_scaleshift_inv_l1_error(top1_prediction, top1_groundtruth)
 
-        top5_prediction = prediction[:5, masked_indices, ...]
-        top5_groundtruth = groundtruth[:5, masked_indices, ...]
-        top5_metric += utils.topk_l1_error(top5_prediction, top5_groundtruth)
-        top5_inv_metric += utils.topk_scaleshift_inv_l1_error(top5_prediction, top5_groundtruth)
+            all_metrics = np.array([top1_metric, top1_inv_metric])
 
-        all_metrics = np.array([top1_metric, top1_inv_metric, top3_metric, top3_inv_metric, top5_metric, top5_inv_metric])
-        all_metrics /= count
+            if not args.evaluate_interpolation:
+                top3_prediction = prediction[:3, masked_indices, -1, ...]
+                top3_groundtruth = groundtruth[:3, masked_indices, -1, ...]
+                top3_metric += utils.topk_l1_error(top3_prediction, top3_groundtruth)
+                top3_inv_metric += utils.topk_scaleshift_inv_l1_error(top3_prediction, top3_groundtruth)
 
-        tab = PrettyTable(headers)
-        tab.add_rows([list(all_metrics)])
-        print(tab)
+                top5_prediction = prediction[:5, masked_indices, -1, ...]
+                top5_groundtruth = groundtruth[:5, masked_indices, -1, ...]
+                top5_metric += utils.topk_l1_error(top5_prediction, top5_groundtruth)
+                top5_inv_metric += utils.topk_scaleshift_inv_l1_error(top5_prediction, top5_groundtruth)
+
+                all_metrics = np.array([top1_metric, top1_inv_metric, top3_metric, top3_inv_metric, top5_metric, top5_inv_metric])
+
+            all_metrics /= count
+
+            tab = PrettyTable(headers)
+            tab.add_rows([list(all_metrics)])
+            print(tab)
+
+        if "rgb" in args.data_format:
+            top1_prediction = prediction[:1, masked_indices, :3, ...]
+            top1_groundtruth = groundtruth[:1, masked_indices, :3, ...]
+            top1_psnr += utils.topk_psnr(top1_prediction, top1_groundtruth)
+
+            top3_prediction = prediction[:3, masked_indices, :3, ...]
+            top3_groundtruth = groundtruth[:3, masked_indices, :3, ...]
+            top3_psnr += utils.topk_psnr(top3_prediction, top3_groundtruth)
+
+            top5_prediction = prediction[:5, masked_indices, :3, ...]
+            top5_groundtruth = groundtruth[:5, masked_indices, :3, ...]
+            top5_psnr += utils.topk_psnr(top5_prediction, top5_groundtruth)
+
+            all_psnr = np.array([top1_psnr[0], top3_psnr[0], top5_psnr[0]])
+
+            all_psnr /= count
+
+            tab = PrettyTable(headers_rgb)
+            tab.add_rows([list(all_psnr)])
+            print(tab)
+
+    if "d" in args.data_format:
+        resultsfile.write(",".join(headers))
+        resultsfile.write(",".join([str(p) for p in all_metrics]))
+
+    if "rgb" in args.data_format:
+        resultsfile.write(",".join(headers_rgb))
+        resultsfile.write(",".join([str(p) for p in all_psnr]))
+
+    resultsfile.close()
+
 
 if __name__ == "__main__":
     args = parse_args()
