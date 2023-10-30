@@ -27,10 +27,10 @@ from packaging import version
 from torchvision import transforms
 from tqdm.auto import tqdm
 
-from transformers import CLIPModel, CLIPImageModelWithProjection
+from transformers import CLIPImageProcessor, CLIPImageModelWithProjection
 
 import diffusers
-from diffusers import DDPMPipeline, DDPMScheduler, UNet2DModel, UNet2DConditionRenderModel
+from diffusers import DDPMPipeline, DDPMScheduler, UNet2DModel, UNet2DConditionRenderModel, UNet2DConditionSpacetimeRenderModel
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, is_accelerate_version, is_tensorboard_available, is_wandb_available
@@ -144,9 +144,9 @@ def parse_args():
         help="What to divide the loaded depth with in order to bring it between -1 to 1",
     )
     parser.add_argument(
-        "--guidance",
+        "--p_unconditional",
         type=float,
-        default=1.0,
+        default=0.1,
         help="Amount of guidance for training with classifier free guidance",
     )
     parser.add_argument(
@@ -726,9 +726,9 @@ def main(args):
         num_workers=args.dataloader_num_workers,
     )
 
-    image_processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
-    image_processor.to(accelerator.device)
-    image_processor.requires_grad_(False)
+    feature_extractor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
+    feature_extractor.to(accelerator.device)
+    feature_extractor.requires_grad_(False)
 
     image_encoder = CLIPImageModelWithProjection.from_pretrained("openai/clip-vit-large-patch14")
     image_encoder.to(accelerator.device)
@@ -846,8 +846,21 @@ def main(args):
             model_inputs = torch.cat([noisy_sample, clean_images[:, :args.num_images, :, :, :]], axis=1)
             model_inputs = model_inputs.reshape(B, -1, H, W)
 
-            image_preprocessed = image_processor(clean_images[:, :args.num_images, :, :, :])
-            image_embedding = image_encoder(image_preprocessed)
+            image_preprocessor_input = clean_images[:, :args.num_images, ...].reshape(B*T, C, H, W)
+            image_preprocessed = feature_extractor(images=image_preprocessor_input, return_tensors="pt").pixel_values
+
+            print("Image preprocessed shape", image_preprocessed.shape)
+
+            dtype = next(image_encoder.parameters()).dtype
+            image_preprocessed = image_preprocessed.to(device=accelerator.device, dtype=dtype)
+            image_embeddings = image_encoder(image_preprocessed).image_embeds
+            print("Image embeddings shape", image_embeddings.shape)
+            image_embeddings = image_embeddings.unsqueeze(1)
+            print("Image embeddings shape after", image_embeddings.shape)
+
+            probability = np.random.rand(B)
+            image_embeddings[torch.where(probability < args.p_unconditional)] = 0.0
+            rendering_poses[torch.where(probability < args.p_unconditional)] = 0.0
 
             with accelerator.accumulate(model):
                 # Predict the noise residual
@@ -856,7 +869,7 @@ def main(args):
                     model_output = model(
                             model_inputs,
                             timesteps,
-                            encoder_hidden_states=(image_embedding, rendering_poses),
+                            encoder_hidden_states=(image_embeddings, rendering_poses),
                             input_indices=None,
                             output_indices=None).sample
                 else:

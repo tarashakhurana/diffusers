@@ -4,3 +4,4 @@ from .pipeline_ddpm_inpainting import DDPMInpaintingPipeline
 from .pipeline_ddpm_depthpose import DDPMDepthPoseInpaintingPipeline
 from .pipeline_ddpm_4dvoxel import DDPM4DVoxelInpaintingPipeline
 from .pipeline_ddpm_img2img import DDPMImg2ImgPipeline
+from .pipeline_ddpm_img2img_clipnpose import DDPMImg2ImgCLIPPosePipeline
