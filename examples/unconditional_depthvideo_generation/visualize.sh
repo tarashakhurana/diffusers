@@ -10,18 +10,23 @@
 #     --in_channels 36
 
 python visualize.py \
-    --model_dir /data3/tkhurana/diffusers/logs/TAO-rgbd_val_img2img_resolution-64_stdunetwithcrossattn_futuresinglestepprediction_sequentialcontext_2shorizon_startfromSD_finetuneverything/ \
-    --checkpoint_number 5000 \
-    --model_type img2img \
-    --eval_data_dir /data/tkhurana/TAO-depth/zoe/frames/val/ \
-    --eval_rgb_data_dir /data3/chengyeh/TAO/frames/val/ \
-    --data_format rgbd \
+    --model_dir /data3/tkhurana/diffusers/logs//TAO-depth_val_0123_bugfix_resolution-64_stdunetwithcrossattn_singlestepprediction_randomsequence_4shorizon_startfromIV_finetuneverything_10xlrforscratchlayers_puncond0.1/ \
+    --checkpoint_number 9000 \
+    --model_type clippose \
+    --eval_data_dir /compute/trinity-2-25/tkhurana/datasets/data/data/tkhurana/TAO-depth/zoe/frames/train/ \
+    --eval_rgb_data_dir /data3/chengyeh/TAO/frames/train/ \
+    --data_format d \
     --train_with_plucker_coords \
     --use_rendering \
-    --in_channels 16 \
-    --out_channels 4 \
+    --in_channels 4 \
+    --out_channels 1 \
     --n_input 3 \
     --n_output 1 \
     --num_images 3 \
+    --prediction_type epsilon \
+    --num_inference_steps 40 \
     --normalization_factor 20480.0 \
-    --masking_strategy custom
+    --masking_strategy custom \
+    --co3d_annotations_root /ssd0/jasonzh2/co3d_v2_recopy/ \
+    --co3d_rgb_data_root /compute/trinity-2-25/tkhurana/datasets/TAO/frames/trainco3d/ \
+    --guidance 2.0

@@ -7,13 +7,14 @@ import argparse
 import numpy as np
 from prettytable import PrettyTable
 from PIL import Image
+from matplotlib import pyplot as plt
 from torchvision import transforms
-from diffusers import DDPMPipeline, DDPMDepthPoseInpaintingPipeline, DDPMInpaintingPipeline, DDPMReconstructionPipeline, DDPMImg2ImgPipeline
-from diffusers import DPMSolverMultistepScheduler, UNet2DModel, UNet2DConditionRenderModel, DDPMScheduler, DDIMScheduler, DDPMConditioningScheduler
+from diffusers import DDPMPipeline, DDPMDepthPoseInpaintingPipeline, DDPMInpaintingPipeline, DDPMReconstructionPipeline, DDPMImg2ImgPipeline, DDPMImg2ImgCLIPPosePipeline
+from diffusers import DPMSolverMultistepScheduler, UNet2DModel, UNet2DConditionRenderModel, UNet2DConditionSpacetimeRenderModel, DDPMScheduler, DDIMScheduler, DDPMConditioningScheduler, EulerDiscreteScheduler
 import matplotlib.cm
-
+from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
 import utils
-from data import TAOMAEDataset, TAOForecastingDataset, OccfusionDataset, collate_fn_depthpose, collate_fn_inpainting, TAOTemporalSuperResolutionDataset, collate_fn_temporalsuperres
+from data import TAOMAEDataset, CO3DEvalDataset, TAOForecastingDataset, OccfusionDataset, collate_fn_depthpose, collate_fn_inpainting, TAOTemporalSuperResolutionDataset, collate_fn_temporalsuperres
 from utils import render_path_spiral, write_pointcloud
 
 
@@ -65,6 +66,26 @@ def parse_args():
         default=6,
     )
     parser.add_argument(
+        "--co3d_annotations_root",
+        type=str,
+        default=None,
+        help=(
+            "A folder containing the training data. Folder contents must follow the structure described in"
+            " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
+            " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
+        ),
+    )
+    parser.add_argument(
+        "--co3d_rgb_data_root",
+        type=str,
+        default=None,
+        help=(
+            "A folder containing the training data. Folder contents must follow the structure described in"
+            " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
+            " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
+        ),
+    )
+    parser.add_argument(
         "--n_output",
         type=int,
         default=6,
@@ -114,6 +135,14 @@ def parse_args():
         default=65.535,
         help=(
             "Factor to divide the input depth images by"
+        ),
+    )
+    parser.add_argument(
+        "--guidance",
+        type=float,
+        default=1.0,
+        help=(
+            "amount of guidance to use for classifier free guidance"
         ),
     )
     parser.add_argument(
@@ -223,14 +252,21 @@ def parse_args():
         choices=["all", "none", "random", "random-half", "half", "custom"],
     )
     parser.add_argument(
+        "--sampler",
+        type=str,
+        default="ddpm",
+        choices=["ddpm", "ddim", "dpm", "euler"],
+    )
+    parser.add_argument(
         "--model_type",
         type=str,
         default="depthpose",
-        choices=["reconstruction", "inpainting", "depthpose", "img2img"],
+        choices=["reconstruction", "inpainting", "depthpose", "img2img", "clippose"],
         help="Whether the model should predict the 'epsilon'/noise error or directly the reconstructed image 'x0'.",
     )
     parser.add_argument("--ddpm_num_steps", type=int, default=1000)
     parser.add_argument("--shuffle_video", action="store_true")
+    parser.add_argument("--co3d_object_crop", action="store_true")
     parser.add_argument("--ddpm_num_inference_steps", type=int, default=1000)
     parser.add_argument("--num_inference_steps", type=int, default=40)
     parser.add_argument("--ddpm_beta_schedule", type=str, default="linear")
@@ -245,6 +281,16 @@ def parse_args():
     return args
 
 
+def return_luminance(pred, gt):
+    weights = torch.Tensor([0.1140, 0.5870, 0.2989])
+    print(pred.shape, gt.shape, weights.shape)
+    pred = torch.einsum("b t c h w, c -> b t h w", pred, weights)
+    gt = torch.einsum("b t c h w, c -> b t h w", gt, weights)
+    pred = pred[:, :, None, :, :]
+    gt = gt[:, :, None, :, :]
+    return pred, gt
+
+
 def main(args):
     load_rgb = False
     rgb_data_root = None
@@ -254,11 +300,15 @@ def main(args):
         rgb_data_root = args.eval_rgb_data_dir
 
     # Initialize the UNet2D
-    Scheduler = DDPMScheduler  # DDPMConditioningScheduler
+    sampler_dict = {"ddpm": DDPMScheduler, "ddim": DDIMScheduler, "dpm": DPMSolverMultistepScheduler, "euler": EulerDiscreteScheduler}
+    Scheduler = sampler_dict[args.sampler]  # DDPMConditioningScheduler
     if args.use_rendering:
         assert args.train_with_plucker_coords
         # assert args.prediction_type == "sample"
-        UNetModel = UNet2DConditionRenderModel
+        if not args.model_type == "clippose":
+            UNetModel = UNet2DConditionRenderModel
+        else:
+            UNetModel = UNet2DConditionSpacetimeRenderModel
     else:
         UNetModel = UNet2DModel
     unet = UNetModel.from_pretrained(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/unet")
@@ -291,21 +341,36 @@ def main(args):
         visualize=False
     )
     """
-    dataset = TAOForecastingDataset(
-        instance_data_root=args.eval_data_dir,
-        size=args.resolution,
-        center_crop=args.center_crop,
-        num_images=args.num_images,
-        fps=30,
-        horizon=1,
-        offset=15,
-        split="val",
-        load_rgb=load_rgb,
-        rgb_data_root=rgb_data_root,
-        interpolation_baseline=args.evaluate_interpolation,
-        normalization_factor=args.normalization_factor,
-        visualize=False
-    )
+    if "trainco3d" in args.eval_data_dir:
+        dataset = CO3DEvalDataset(
+            instance_data_root=args.eval_data_dir,
+            size=args.resolution,
+            center_crop=args.center_crop,
+            num_images=args.num_images,
+            split="val",
+            load_rgb=load_rgb,
+            co3d_object_crop=args.co3d_object_crop,
+            co3d_annotations_root=args.co3d_annotations_root,
+            co3d_rgb_data_root=args.co3d_rgb_data_root,
+            normalization_factor=args.normalization_factor,
+        )
+    else:
+        dataset = TAOForecastingDataset(
+            instance_data_root=args.eval_data_dir,
+            size=args.resolution,
+            center_crop=args.center_crop,
+            num_images=args.num_images,
+            fps=30,
+            horizon=11,
+            offset=15,
+            split="val",
+            load_rgb=load_rgb,
+            rgb_data_root=rgb_data_root,
+            interpolation_baseline=args.evaluate_interpolation,
+            normalization_factor=args.normalization_factor,
+            visualize=False
+        )
+
     """
     dataset = TAOTemporalSuperResolutionDataset(
         instance_data_root=args.eval_data_dir,
@@ -323,7 +388,7 @@ def main(args):
 
     if args.model_type == "inpainting" or args.model_type == "reconstruction":
         collate_fn = collate_fn_inpainting
-    elif args.model_type == "depthpose" or args.model_type == "img2img":
+    elif args.model_type == "depthpose" or args.model_type == "img2img" or args.model_type == "clippose":
         collate_fn = collate_fn_depthpose
 
     eval_dataloader = torch.utils.data.DataLoader(
@@ -375,12 +440,36 @@ def main(args):
         kwargs["use_rendering"] = args.use_rendering
         kwargs["data_format"] = args.data_format
         pipeline = DDPMImg2ImgPipeline(unet=unet, scheduler=noise_scheduler, kwargs=kwargs)
+    elif args.model_type == "clippose":
+        feature_extractor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14", do_rescale=False, do_normalize=False)
+
+        image_encoder = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14")
+        image_encoder.to("cuda:0")
+        image_encoder.eval()
+        kwargs = {}
+        kwargs["n_input"] = args.n_input
+        kwargs["n_output"] = args.n_output
+        kwargs["masking_strategy"] = args.masking_strategy
+        kwargs["train_with_plucker_coords"] = args.train_with_plucker_coords
+        kwargs["use_rendering"] = args.use_rendering
+        kwargs["data_format"] = args.data_format
+        pipeline = DDPMImg2ImgCLIPPosePipeline(unet=unet, scheduler=noise_scheduler, feature_extractor=feature_extractor, image_encoder=image_encoder, kwargs=kwargs)
 
     generator = torch.Generator(device=pipeline.device).manual_seed(0)
     # run pipeline in inference (sample random noise and denoise)
 
+    # load the depth models to get depth maps for generated images on the fly
+    # torch.hub.help("intel-isl/MiDaS", "DPT_BEiT_L_384", force_reload=True)  # Triggers fresh download of MiDaS repo
+    # repo = "isl-org/ZoeDepth"
+    # Zoe_N
+    # model_zoe_n = torch.hub.load(repo, "ZoeD_N", pretrained=True)
+    # DEVICE = "cuda"
+    # zoe = model_zoe_n.to(DEVICE)
+
     top1_metric, top3_metric, top5_metric = 0, 0, 0
     top1_inv_metric, top3_inv_metric, top5_inv_metric = 0, 0, 0
+    top1_zoe_metric, top3_zoe_metric, top5_zoe_metric = 0, 0, 0
+    top1_zoe_inv_metric, top3_zoe_inv_metric, top5_zoe_inv_metric = 0, 0, 0
 
     top1_psnr, top3_psnr, top5_psnr = 0, 0, 0
 
@@ -395,7 +484,7 @@ def main(args):
         headers_rgb = ['Top1 PSNR', 'Top3 PSNR', 'Top5 PSNR']
 
     # open the results file
-    resultsfile = open(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/results.txt", "w")
+    resultsfile = open(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/results_{args.sampler}_guidance{args.guidance}.txt", "w")
 
     for b, batch in enumerate(eval_dataloader):
 
@@ -476,12 +565,26 @@ def main(args):
                     ).images
 
                 prediction = torch.from_numpy(prediction).permute(0, 3, 1, 2)
+            elif args.model_type == "clippose":
+                print("getting predictions using args.num_masks", args.num_masks, data_point.shape, plucker.shape)
+                start = time.time()
+                prediction, _ = pipeline(
+                        inpainting_image=(data_point, plucker),
+                        batch_size=batch_size,
+                        guidance=args.guidance,
+                        num_inference_steps=args.num_inference_steps,
+                        output_type="numpy",
+                        user_num_masks=args.num_masks,
+                        user_time_indices=time_indices,
+                    ).images
+                print(time.time() - start)
+                prediction = torch.from_numpy(prediction).permute(0, 3, 1, 2)
 
         else:
             prediction = batch["interp_depth"]
-            masked_indices = np.array([0])
+        print("unique valies in preed", np.unique(prediction))
 
-        if not args.model_type == "img2img":
+        if not args.model_type in ["img2img", "clippose"]:
             prediction = prediction[:, :, None, :, :]
         else:
             prediction = prediction.reshape(B, 1, C, H, W)
@@ -491,14 +594,14 @@ def main(args):
         B, T, C, H, W = prediction.shape
         count += 1
 
-        if args.model_type == "img2img":
+        if args.model_type in ["img2img", "clippose"]:
             assert data_point.ndim == 5
         else:
             assert data_point.ndim == 4
         groundtruth = data_point.cpu()
 
-        # open the results file
-        resultsfile = open(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/results.txt", "w")
+        # prediction = prediction / 2 + 0.5
+        groundtruth = groundtruth / 2 + 0.5
 
         # shapes of prediction are batch x frames x height x width
         # shapes of groundtruth is the same
@@ -533,33 +636,74 @@ def main(args):
             print(tab)
 
         if "rgb" in args.data_format:
-            top1_prediction = prediction[:1, masked_indices, :3, ...]
-            top1_groundtruth = groundtruth[:1, masked_indices, :3, ...]
-            top1_psnr += utils.topk_psnr(top1_prediction, top1_groundtruth)
+            if args.data_format == "rgb":
+                end_index = prediction.shape[2]
+            else:
+                end_index = -1
+            top1_prediction = prediction[:1, masked_indices, :end_index, ...]
+            top1_groundtruth = groundtruth[:1, masked_indices, :end_index, ...]
+            top1_prediction_l, top1_groundtruth_l = return_luminance(top1_prediction, top1_groundtruth)
+            top1_psnr += utils.topk_psnr(top1_prediction_l, top1_groundtruth_l)
 
-            top3_prediction = prediction[:3, masked_indices, :3, ...]
-            top3_groundtruth = groundtruth[:3, masked_indices, :3, ...]
-            top3_psnr += utils.topk_psnr(top3_prediction, top3_groundtruth)
+            top3_prediction = prediction[:3, masked_indices, :end_index, ...]
+            top3_groundtruth = groundtruth[:3, masked_indices, :end_index, ...]
+            top3_prediction_l, top3_groundtruth_l = return_luminance(top3_prediction, top3_groundtruth)
+            top3_psnr += utils.topk_psnr(top3_prediction_l, top3_groundtruth_l)
 
-            top5_prediction = prediction[:5, masked_indices, :3, ...]
-            top5_groundtruth = groundtruth[:5, masked_indices, :3, ...]
-            top5_psnr += utils.topk_psnr(top5_prediction, top5_groundtruth)
+            top5_prediction = prediction[:5, masked_indices, :end_index, ...]
+            top5_groundtruth = groundtruth[:5, masked_indices, :end_index, ...]
+            top5_prediction_l, top5_groundtruth_l = return_luminance(top5_prediction, top5_groundtruth)
+            top5_psnr += utils.topk_psnr(top5_prediction_l, top5_groundtruth_l)
 
             all_psnr = np.array([top1_psnr[0], top3_psnr[0], top5_psnr[0]])
 
             all_psnr /= count
 
+            """
+            if top5_prediction.shape[2] == 1:
+                top5_prediction = torch.cat([top5_prediction] * 3, axis=2)[:, 0, ...]
+                top5_groundtruth = torch.cat([top5_groundtruth] * 3, axis=2)[:, 0, ...]
+            else:
+                top5_prediction = top5_prediction[:, 0, ...]
+
+            top5_prediction_depth = zoe.infer(top5_prediction.to(DEVICE)).cpu().detach()
+            top5_groundtruth_depth = zoe.infer(top5_groundtruth.to(DEVICE)).cpu().detach()
+            top1_prediction_depth = top5_prediction_depth[:1, ...]
+            top1_groundtruth_depth = top5_groundtruth_depth[:1, ...]
+            top3_prediction_depth = top5_prediction_depth[:3, ...]
+            top3_groundtruth_depth = top5_groundtruth_depth[:3, ...]
+
+            top1_zoe_metric += utils.topk_l1_error(top1_prediction_depth, top1_groundtruth_depth)
+            top1_zoe_inv_metric += utils.topk_scaleshift_inv_l1_error(top1_prediction_depth, top1_groundtruth_depth)
+
+            top3_zoe_metric += utils.topk_l1_error(top3_prediction_depth, top3_groundtruth_depth)
+            top3_zoe_inv_metric += utils.topk_scaleshift_inv_l1_error(top3_prediction_depth, top3_groundtruth_depth)
+
+            top5_zoe_metric += utils.topk_l1_error(top5_prediction_depth, top5_groundtruth_depth)
+            top5_zoe_inv_metric += utils.topk_scaleshift_inv_l1_error(top5_prediction_depth, top5_groundtruth_depth)
+
+            all_zoe_metrics = np.array([top1_zoe_metric, top1_zoe_inv_metric, top3_zoe_metric, top3_zoe_inv_metric, top5_zoe_metric, top5_zoe_inv_metric])
+
+            all_zoe_metrics /= count
+            """
+
             tab = PrettyTable(headers_rgb)
             tab.add_rows([list(all_psnr)])
             print(tab)
 
+            """
+            tab = PrettyTable(headers)
+            tab.add_rows([list(all_zoe_metrics)])
+            print(tab)
+            """
+
     if "d" in args.data_format:
-        resultsfile.write(",".join(headers))
-        resultsfile.write(",".join([str(p) for p in all_metrics]))
+        resultsfile.write(",".join(headers) + "\n")
+        resultsfile.write(",".join([str(p) for p in all_metrics]) + "\n")
 
     if "rgb" in args.data_format:
-        resultsfile.write(",".join(headers_rgb))
-        resultsfile.write(",".join([str(p) for p in all_psnr]))
+        resultsfile.write(",".join(headers_rgb) + "\n")
+        resultsfile.write(",".join([str(p) for p in all_psnr]) + "\n")
 
     resultsfile.close()
 

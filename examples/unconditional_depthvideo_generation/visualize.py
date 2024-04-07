@@ -7,14 +7,22 @@ import argparse
 import numpy as np
 from PIL import Image, ImageOps
 from torchvision import transforms
-from diffusers import DDPMPipeline, DDPMDepthPoseInpaintingPipeline, DDPMInpaintingPipeline, DDPMReconstructionPipeline, DDPMImg2ImgPipeline
-from diffusers import DPMSolverMultistepScheduler, UNet2DModel, UNet2DConditionRenderModel, DDPMScheduler, DDIMScheduler, DDPMConditioningScheduler
+from diffusers import DDPMPipeline, DDPMDepthPoseInpaintingPipeline, DDPMInpaintingPipeline, DDPMReconstructionPipeline, DDPMImg2ImgPipeline, DDPMImg2ImgCLIPPosePipeline
+from diffusers import DPMSolverMultistepScheduler, UNet2DModel, UNet2DConditionRenderModel, UNet2DConditionSpacetimeRenderModel, DDPMScheduler, DDIMScheduler, DDPMConditioningScheduler
 import matplotlib.cm
-
+from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
 import utils
-from data import TAOMAEDataset, TAOForecastingDataset, OccfusionDataset, collate_fn_depthpose, collate_fn_inpainting, TAOTemporalSuperResolutionDataset, collate_fn_temporalsuperres
+from data import TAOMAEDataset, CO3DEvalDataset, TAOForecastingDataset, OccfusionDataset, collate_fn_depthpose, collate_fn_inpainting, TAOTemporalSuperResolutionDataset, collate_fn_temporalsuperres
 from utils import render_path_spiral, write_pointcloud
 
+import matplotlib.pyplot as plt
+import matplotlib.colors as colors
+
+def truncate_colormap(cmap, minval=0.0, maxval=1.0, n=100):
+    new_cmap = colors.LinearSegmentedColormap.from_list(
+        'trunc({n},{a:.2f},{b:.2f})'.format(n=cmap.name, a=minval, b=maxval),
+        cmap(np.linspace(minval, maxval, n)))
+    return new_cmap
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
@@ -54,6 +62,28 @@ def parse_args():
         "--n_input",
         type=int,
         default=6,
+    )
+    parser.add_argument(
+        "--co3d_annotations_root",
+        type=str,
+        default=None,
+        help=(
+            "A folder containing the training data. Folder contents must follow the structure described in"
+            " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
+            " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
+        ),
+    )
+    parser.add_argument("--co3d_object_crop", action="store_true")
+    parser.add_argument("--visualize_interpolation", action="store_true")
+    parser.add_argument(
+        "--co3d_rgb_data_root",
+        type=str,
+        default=None,
+        help=(
+            "A folder containing the training data. Folder contents must follow the structure described in"
+            " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
+            " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
+        ),
     )
     parser.add_argument(
         "--n_output",
@@ -105,6 +135,14 @@ def parse_args():
         default=65.535,
         help=(
             "Factor to divide the input depth images by"
+        ),
+    )
+    parser.add_argument(
+        "--guidance",
+        type=float,
+        default=1.0,
+        help=(
+            "Amount of guidance at inference for classifier free guidance"
         ),
     )
     parser.add_argument(
@@ -219,7 +257,7 @@ def parse_args():
         "--model_type",
         type=str,
         default="depthpose",
-        choices=["reconstruction", "inpainting", "depthpose", "img2img"],
+        choices=["reconstruction", "inpainting", "depthpose", "img2img", "clippose"],
         help="Whether the model should predict the 'epsilon'/noise error or directly the reconstructed image 'x0'.",
     )
     parser.add_argument("--ddpm_num_steps", type=int, default=1000)
@@ -251,7 +289,10 @@ def main(args):
     if args.use_rendering:
         assert args.train_with_plucker_coords
         # assert args.prediction_type == "sample"
-        UNetModel = UNet2DConditionRenderModel
+        if not args.model_type == "clippose":
+            UNetModel = UNet2DConditionRenderModel
+        else:
+            UNetModel = UNet2DConditionSpacetimeRenderModel
     else:
         UNetModel = UNet2DModel
     unet = UNetModel.from_pretrained(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/unet")
@@ -282,20 +323,35 @@ def main(args):
         visualize=False
     )
     """
-    dataset = TAOForecastingDataset(
-        instance_data_root=args.eval_data_dir,
-        size=args.resolution,
-        center_crop=args.center_crop,
-        num_images=args.num_images,
-        fps=30,
-        horizon=1,
-        offset=15,
-        split="val",
-        load_rgb=load_rgb,
-        rgb_data_root=rgb_data_root,
-        normalization_factor=args.normalization_factor,
-        visualize=False
-    )
+    if "trainco3d" in args.eval_data_dir:
+        dataset = CO3DEvalDataset(
+            instance_data_root=args.eval_data_dir,
+            size=args.resolution,
+            center_crop=args.center_crop,
+            num_images=args.num_images,
+            split="val",
+            load_rgb=load_rgb,
+            co3d_object_crop=args.co3d_object_crop,
+            co3d_annotations_root=args.co3d_annotations_root,
+            co3d_rgb_data_root=args.co3d_rgb_data_root,
+            normalization_factor=args.normalization_factor,
+        )
+    else:
+        dataset = TAOForecastingDataset(
+            instance_data_root=args.eval_data_dir,
+            size=args.resolution,
+            center_crop=args.center_crop,
+            num_images=args.num_images,
+            fps=30,
+            horizon=1,
+            offset=15,
+            split="val",
+            load_rgb=load_rgb,
+            rgb_data_root=rgb_data_root,
+            normalization_factor=args.normalization_factor,
+            visualize=False,
+            interpolation_baseline=args.visualize_interpolation
+        )
     """
     dataset = TAOTemporalSuperResolutionDataset(
         instance_data_root=args.eval_data_dir,
@@ -313,7 +369,7 @@ def main(args):
 
     if args.model_type == "inpainting" or args.model_type == "reconstruction":
         collate_fn = collate_fn_inpainting
-    elif args.model_type == "depthpose" or args.model_type == "img2img":
+    elif args.model_type == "depthpose" or args.model_type == "img2img" or args.model_type == "clippose":
         collate_fn = collate_fn_depthpose
 
     eval_dataloader = torch.utils.data.DataLoader(
@@ -365,6 +421,20 @@ def main(args):
         kwargs["use_rendering"] = args.use_rendering
         kwargs["data_format"] = args.data_format
         pipeline = DDPMImg2ImgPipeline(unet=unet, scheduler=noise_scheduler, kwargs=kwargs)
+    elif args.model_type == "clippose":
+        feature_extractor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14", do_rescale=False, do_normalize=False)
+
+        image_encoder = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14")
+        image_encoder.to("cuda:0")
+        image_encoder.eval()
+        kwargs = {}
+        kwargs["n_input"] = args.n_input
+        kwargs["n_output"] = args.n_output
+        kwargs["masking_strategy"] = args.masking_strategy
+        kwargs["train_with_plucker_coords"] = args.train_with_plucker_coords
+        kwargs["use_rendering"] = args.use_rendering
+        kwargs["data_format"] = args.data_format
+        pipeline = DDPMImg2ImgCLIPPosePipeline(unet=unet, scheduler=noise_scheduler, feature_extractor=feature_extractor, image_encoder=image_encoder, kwargs=kwargs)
 
     generator = torch.Generator(device=pipeline.device).manual_seed(0)
     # run pipeline in inference (sample random noise and denoise)
@@ -377,6 +447,8 @@ def main(args):
         #     continue
 
         data_point = batch["input"].to("cuda:0")
+        filename = batch["filenames"][0][2]
+        seq = str(filename)[len(str(args.eval_data_dir)):str(filename).rfind("/")]
         data_point = data_point[:, :, None, :, :]
 
         if args.train_with_plucker_coords:
@@ -402,10 +474,10 @@ def main(args):
         total_frames = data_point.shape[1]
         past_frames = torch.stack([data_point[0, :int(total_frames / 2), ...]] * 1)
         future_frames = torch.stack([data_point[0, int(total_frames / 2):, ...]] * 1)
-        data_point = torch.stack([data_point[0, ...]] * 4)
-        plucker = torch.stack([plucker[0, ...]] * 4)
-        plucker[:, 3:4, :] = plucker[:, 3:4, :] + (torch.arange(4)[:, None, None].to("cuda:0") - 2)
-        batch_size = 4
+        data_point = torch.stack([data_point[0, ...]] * 12)
+        plucker = torch.stack([plucker[0, ...]] * 12)
+        # plucker[:, 3:4, :] = plucker[:, 3:4, :] + (torch.arange(4)[:, None, None].to("cuda:0") - 2)
+        batch_size = 12
         print("data point and plucker shape", data_point.shape, plucker.shape)
 
         if args.visualize_spiral:
@@ -422,49 +494,63 @@ def main(args):
             time_indices = torch.Tensor([3]).int() # [0,1,2,3,4,5,7,8,9,10,11]
             args.num_masks = 1  # 11
 
-        if args.model_type == "reconstruction":
-            prediction = pipeline(
-                    batch_size=batch_size,
-                    num_inference_steps=args.num_inference_steps,
-                    cond_inds=torch.arange(int(total_frames / 2)),
-                    recon_scale=10,
-                    conditioning=past_frames,
-                    output_type="numpy").images
-        elif args.model_type == "inpainting":
-            prediction, unmasked_indices = pipeline(
-                    inpainting_image=data_point,
-                    batch_size=batch_size,
-                    num_inference_steps=args.num_inference_steps,
-                    output_type="numpy",
-                    user_num_masks=args.num_masks,
-                    user_time_indices=time_indices).images
-            masked_indices = np.array([i for i in range(args.n_input + args.n_output) if i not in unmasked_indices.tolist()])
-        elif args.model_type == "depthpose":
-            print("getting predictions using args.num_masks", args.num_masks)
-            prediction, unmasked_indices = pipeline(
-                    inpainting_image=(data_point, plucker),
-                    batch_size=batch_size,
-                    num_inference_steps=args.num_inference_steps,
-                    output_type="numpy",
-                    user_num_masks=args.num_masks,
-                    user_time_indices=time_indices,
-                ).images
-            masked_indices = np.array([i for i in range(args.n_input + args.n_output) if i not in unmasked_indices.tolist()])
-        elif args.model_type == "img2img":
-            print("getting predictions using args.num_masks", args.num_masks)
-            prediction, _ = pipeline(
-                    inpainting_image=(data_point, plucker),
-                    batch_size=batch_size,
-                    num_inference_steps=args.num_inference_steps,
-                    output_type="numpy",
-                    user_num_masks=args.num_masks,
-                    user_time_indices=time_indices,
-                ).images
-
+        if not args.visualize_interpolation:
+            if args.model_type == "reconstruction":
+                prediction = pipeline(
+                        batch_size=batch_size,
+                        num_inference_steps=args.num_inference_steps,
+                        cond_inds=torch.arange(int(total_frames / 2)),
+                        recon_scale=10,
+                        conditioning=past_frames,
+                        output_type="numpy").images
+            elif args.model_type == "inpainting":
+                prediction, unmasked_indices = pipeline(
+                        inpainting_image=data_point,
+                        batch_size=batch_size,
+                        num_inference_steps=args.num_inference_steps,
+                        output_type="numpy",
+                        user_num_masks=args.num_masks,
+                        user_time_indices=time_indices).images
+                masked_indices = np.array([i for i in range(args.n_input + args.n_output) if i not in unmasked_indices.tolist()])
+            elif args.model_type == "depthpose":
+                print("getting predictions using args.num_masks", args.num_masks)
+                prediction, unmasked_indices = pipeline(
+                        inpainting_image=(data_point, plucker),
+                        batch_size=batch_size,
+                        num_inference_steps=args.num_inference_steps,
+                        output_type="numpy",
+                        user_num_masks=args.num_masks,
+                        user_time_indices=time_indices,
+                    ).images
+                masked_indices = np.array([i for i in range(args.n_input + args.n_output) if i not in unmasked_indices.tolist()])
+            elif args.model_type == "img2img":
+                print("getting predictions using args.num_masks", args.num_masks)
+                prediction, _ = pipeline(
+                        inpainting_image=(data_point, plucker),
+                        batch_size=batch_size,
+                        num_inference_steps=args.num_inference_steps,
+                        output_type="numpy",
+                        user_num_masks=args.num_masks,
+                        user_time_indices=time_indices,
+                    ).images
+            elif args.model_type == "clippose":
+                print("getting predictions using args.num_masks", args.num_masks)
+                prediction, _ = pipeline(
+                        inpainting_image=(data_point, plucker),
+                        batch_size=batch_size,
+                        guidance=args.guidance,
+                        num_inference_steps=args.num_inference_steps,
+                        output_type="numpy",
+                        user_num_masks=args.num_masks,
+                        user_time_indices=time_indices,
+                    ).images
+        else:
+            prediction = batch["interp_depth"].numpy()
+            masked_indices = np.array([0])
 
         prediction = torch.from_numpy(prediction).permute(0, 3, 1, 2)
 
-        if not args.model_type == "img2img":
+        if not args.model_type in ["img2img", "clippose"]:
             prediction = prediction[:, :, None, :, :]
         else:
             prediction = prediction.reshape(batch_size, 1, C, H, W)
@@ -494,21 +580,46 @@ def main(args):
                 if "d" in args.data_format:
                     prediction_minmax = (prediction[b, framenumber, -1] - prediction[b, framenumber, -1].min()) / (prediction[b, framenumber, -1].max() - prediction[b, framenumber, -1].min())
                     if framenumber in masked_indices:
-                        cmap = matplotlib.cm.get_cmap('inferno')
+                        cmap = matplotlib.cm.get_cmap('jet_r')
+                        cmap = truncate_colormap(cmap, 0.6, 1.0)
                     else:
-                        cmap = matplotlib.cm.get_cmap('gray')
+                        cmap = matplotlib.cm.get_cmap('gray_r')
+                        # cmap = matplotlib.cm.get_cmap('jet_r')
+                        # cmap = truncate_colormap(cmap, 0.6, 1.0)
                     colored_image = cmap(prediction_minmax)
                     colored_images.append(Image.fromarray((colored_image * 255).astype(np.uint8)))
+                    if framenumber in masked_indices:
+                        groundtruth = data_point[b, framenumber, -1].cpu().numpy() / 2 + 0.5
+                        groundtruth = cmap(groundtruth)
+                        os.makedirs(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/train_visuals_ddpm", exist_ok=True)
+                        os.makedirs(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/train_visuals_ddpm/{seq}", exist_ok=True)
+                        path = f"{args.model_dir}/checkpoint-{args.checkpoint_number}/train_visuals_ddpm/{seq}/depth_3_{b}.png"
+                        gtpath = f"{args.model_dir}/checkpoint-{args.checkpoint_number}/train_visuals_ddpm/{seq}/depth_gt.png"
+                        npypath = f"{args.model_dir}/checkpoint-{args.checkpoint_number}/train_visuals_ddpm/{seq}/depth.npy"
+                        np.save(npypath, prediction[b, framenumber, -1])
+                        Image.fromarray((colored_image * 255).astype(np.uint8)).save(path)
+                        Image.fromarray((groundtruth * 255).astype(np.uint8)).save(gtpath)
+
+                    else:
+                        os.makedirs(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/train_visuals_ddpm/{seq}", exist_ok=True)
+                        path = f"{args.model_dir}/checkpoint-{args.checkpoint_number}/train_visuals_ddpm/{seq}/input_{framenumber}_depth.png"
+                        Image.fromarray((colored_image * 255).astype(np.uint8)).save(path)
+
                     batch_colored_images[b].append(Image.fromarray((colored_image * 255).astype(np.uint8)))
 
                 if "rgb" in args.data_format:
-                    prediction_minmax = prediction[b, framenumber, :3].permute(1, 2, 0).numpy()[:, :, ::-1]
+                    prediction_minmax = prediction[b, framenumber, :3].permute(1, 2, 0).numpy().squeeze()[:, :, ::-1]
                     colored_rgb_image = Image.fromarray((prediction_minmax * 255).astype(np.uint8))
                     # if framenumber not in masked_indices:
                     #     colored_rgb_image = ImageOps.grayscale(colored_rgb_image)
+                    if framenumber in masked_indices:
+                        os.makedirs(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/train_visuals_ddpm", exist_ok=True)
+                        path = f"{args.model_dir}/checkpoint-{args.checkpoint_number}/train_visuals_ddpm/{count}_rgb.png"
+                        colored_rgb_image.save(path)
                     colored_rgb_images.append(colored_rgb_image)
                     batch_colored_rgb_images[b].append(colored_rgb_image)
 
+                """
                 if args.visualize_3d:
                     ro = ray_origin[b, framenumber, ...].numpy().reshape(1, 3)
                     rd = ray_direction[b, framenumber, ...].numpy().reshape(H, W, 3)
@@ -551,7 +662,7 @@ def main(args):
                     all_edges.append(np.array([i-1, i-3]))
                     all_edges.append(np.array([i-1, i-4]))
                     all_edges.append(np.array([i-1, i-5]))
-
+                """
 
             if args.visualize_3d:
                 all_points = np.concatenate(all_points, axis=0)
@@ -561,12 +672,13 @@ def main(args):
 
             if "d" in args.data_format:
                 os.makedirs(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/train_visuals_ddpm", exist_ok=True)
-                utils.make_gif(colored_images, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/train_visuals_ddpm/2d_{count}.gif", duration=800)
+                # utils.make_gif(colored_images, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/train_visuals_ddpm/2d_{count}.gif", duration=800)
 
             if "rgb" in args.data_format:
                 os.makedirs(f"{args.model_dir}/checkpoint-{args.checkpoint_number}/train_visuals_rgb_ddpm", exist_ok=True)
                 utils.make_gif(colored_rgb_images, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/train_visuals_rgb_ddpm/2d_{count}.gif", duration=800)
 
+        """
         if "d" in args.data_format:
             batch_colored_images_toplot = []
             widths, heights = zip(*(i.size for i in batch_colored_images[0]))
@@ -591,7 +703,7 @@ def main(args):
 
             for i in range(len(batch_colored_rgb_images[0])):
                 x_offset = 0
-                new_im = Image.new('RGB', (total_width, max_height))
+                new_im = Image.new('L', (total_width, max_height))
                 for b in range(prediction.shape[0]):
                     new_im.paste(batch_colored_rgb_images[b][i], (x_offset,0))
                     x_offset += batch_colored_rgb_images[b][i].size[0]
@@ -602,6 +714,8 @@ def main(args):
         if args.visualize_spiral:
             spiral.append(colored_images[6])
             utils.make_gif(spiral, f"{args.model_dir}/checkpoint-{args.checkpoint_number}/visuals_ddpm/spiral_{count}.gif", duration=800)
+
+        """
 
 
 if __name__ == "__main__":

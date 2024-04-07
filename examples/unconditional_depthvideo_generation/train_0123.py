@@ -12,9 +12,9 @@ import datasets
 import torch
 from copy import deepcopy
 from einops import repeat
-from torchsummary import summary
 import numpy as np
 import torch.nn.functional as F
+import PIL
 from PIL import Image
 from torch.utils.data import Dataset
 from accelerate import Accelerator
@@ -27,7 +27,7 @@ from packaging import version
 from torchvision import transforms
 from tqdm.auto import tqdm
 
-from transformers import CLIPImageProcessor, CLIPImageModelWithProjection
+from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
 
 import diffusers
 from diffusers import DDPMPipeline, DDPMScheduler, UNet2DModel, UNet2DConditionRenderModel, UNet2DConditionSpacetimeRenderModel
@@ -147,7 +147,7 @@ def parse_args():
         "--p_unconditional",
         type=float,
         default=0.1,
-        help="Amount of guidance for training with classifier free guidance",
+        help="Probability with which to drop the conditioning at training",
     )
     parser.add_argument(
         "--train_data_dir",
@@ -170,12 +170,33 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--co3d_annotations_root",
+        type=str,
+        default=None,
+        help=(
+            "A folder containing the training data. Folder contents must follow the structure described in"
+            " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
+            " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
+        ),
+    )
+    parser.add_argument(
+        "--co3d_rgb_data_root",
+        type=str,
+        default=None,
+        help=(
+            "A folder containing the training data. Folder contents must follow the structure described in"
+            " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
+            " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
+        ),
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
         default="ddpm-model-64",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument("--overwrite_output_dir", action="store_true")
+    parser.add_argument("--co3d_object_crop", action="store_true")
     parser.add_argument("--bigger_model", action="store_true")
     parser.add_argument("--visualize_dataloader", action="store_true")
     parser.add_argument("--shuffle_video", action="store_true")
@@ -419,7 +440,7 @@ def main(args):
     if args.use_rendering:
         assert args.train_with_plucker_coords
         # assert args.prediction_type == "sample"
-        UNetModel = UNet2DConditionRenderModel
+        UNetModel = UNet2DConditionSpacetimeRenderModel
     else:
         UNetModel = UNet2DModel
 
@@ -435,7 +456,7 @@ def main(args):
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.logger,
-        logging_dir=logging_dir,
+        project_dir=logging_dir,
         project_config=accelerator_project_config,
         # kwargs_handlers=[ddp_kwargs]
     )
@@ -554,6 +575,7 @@ def main(args):
                 up_block_types=up_block_types,
             )
         else:
+            """
             model = UNetModel(
                 sample_size=args.resolution,
                 in_channels=args.in_channels,
@@ -574,16 +596,23 @@ def main(args):
                 norm_num_groups=32
             )
             """
-            # st = torch.load("diffusion_pytorch_model.bin")
+            if args.data_format == "rgbd":
+                condition_attention_dim_pre = 2176  # 3712
+            else:
+                condition_attention_dim_pre = 1408
+            st = torch.load("stable_diffusion_image_variations_unet.bin")
             model = UNetModel(
                 sample_size=args.resolution,
                 in_channels=args.in_channels,
                 out_channels=args.out_channels,
-                cross_attention_dim=1280,  # 36,
+                cross_attention_dim_pre=condition_attention_dim_pre,
+                cross_attention_dim=768,  # 36,
                 act_fn="silu",
                 attention_head_dim=8,
                 block_out_channels=[320, 640, 1280, 1280],
                 center_input_sample=False,
+                dual_cross_attention=False,
+                only_cross_attention=False,
                 downsample_padding=1,
                 flip_sin_to_cos=True,
                 freq_shift=0,
@@ -594,18 +623,14 @@ def main(args):
             )
             for name, params in model.named_parameters():
                 if name in st:
-                    if 'attn2' in name:
-                        continue
-                    else:
-                        params.data = st[f'{name}']
-                        # params.requires_grad = False
-            """
+                    params.data = st[f'{name}']
+                    # params.requires_grad = False
     else:
         config = UNetModel.load_config(args.model_config_name_or_path)
         model = UNetModel.from_config(config)
 
     print("Total number of parameters in model", model.num_parameters(only_trainable=True))
-    print(summary(model))
+    # print(summary(model, input_size=(4, 64, 64)))
 
     # Create EMA for the model.
     if args.use_ema:
@@ -650,6 +675,29 @@ def main(args):
         visualization_scheduler = DDPMScheduler(num_train_timesteps=args.ddpm_num_steps, beta_schedule=args.ddpm_beta_schedule)
 
     # Initialize the optimizer
+    finetune_params = []
+    for name, param in model.named_parameters():
+            if "conv_in_render" in name \
+            or "conv_out_render" in name \
+            or "conditioning_compressor" in name \
+            or "pool_clip_features" in name:
+                continue
+            else:
+                finetune_params.append(param)
+    optimizer = torch.optim.AdamW(
+        [
+            {'params': finetune_params},
+            {'params': model.conv_in_render.parameters(), 'lr': args.learning_rate * 10},
+            {'params': model.conv_out_render.parameters(), 'lr': args.learning_rate * 10},
+            {'params': model.conditioning_compressor.parameters(), 'lr': args.learning_rate * 10},
+            {'params': model.pool_clip_features.parameters(), 'lr': args.learning_rate * 10},
+        ],
+        lr=args.learning_rate,
+        betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.adam_weight_decay,
+        eps=args.adam_epsilon,
+    )
+    """
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
@@ -657,6 +705,7 @@ def main(args):
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
+    """
 
     """
     dataset = OccfusionDataset(
@@ -679,8 +728,12 @@ def main(args):
         center_crop=args.center_crop,
         num_images=args.num_images,
         fps=args.fps,
+        horizon=2,
         load_rgb=load_rgb,
         rgb_data_root=rgb_data_root,
+        co3d_object_crop=args.co3d_object_crop,
+        co3d_annotations_root=args.co3d_annotations_root,
+        co3d_rgb_data_root=args.co3d_rgb_data_root,
         split="train",
         normalization_factor=args.normalization_factor,
         visualize=args.visualize_dataloader
@@ -692,7 +745,7 @@ def main(args):
         center_crop=args.center_crop,
         num_images=args.num_images,
         fps=args.fps,
-        horizon=1,
+        horizon=11,
         offset=15,
         load_rgb=load_rgb,
         rgb_data_root=rgb_data_root,
@@ -726,11 +779,9 @@ def main(args):
         num_workers=args.dataloader_num_workers,
     )
 
-    feature_extractor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
-    feature_extractor.to(accelerator.device)
-    feature_extractor.requires_grad_(False)
+    feature_extractor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14", do_rescale=False, do_normalize=False)
 
-    image_encoder = CLIPImageModelWithProjection.from_pretrained("openai/clip-vit-large-patch14")
+    image_encoder = CLIPVisionModelWithProjection.from_pretrained("openai/clip-vit-large-patch14")
     image_encoder.to(accelerator.device)
     image_encoder.requires_grad_(False)
 
@@ -834,31 +885,66 @@ def main(args):
             noise = torch.randn(clean_sample.shape).to(clean_sample.device)
             bsz = clean_sample.shape[0]
             # Sample a random timestep for each image
-            # timesteps = torch.Tensor([noise_scheduler.config.num_train_timesteps - 1]).to(clean_sample.device).long()
-            timesteps = torch.randint(
-                0, noise_scheduler.config.num_train_timesteps, (bsz,), device=clean_sample.device
-            ).long()
+            timesteps = torch.Tensor([noise_scheduler.config.num_train_timesteps - 1]).to(clean_sample.device).long()
+            # timesteps = torch.randint(
+            #     0, noise_scheduler.config.num_train_timesteps, (bsz,), device=clean_sample.device
+            # ).long()
 
             # Add noise to the clean images according to the noise magnitude at each timestep
             # (this is the forward diffusion process)
             noisy_sample = noise_scheduler.add_noise(clean_sample, noise, timesteps)
 
-            model_inputs = torch.cat([noisy_sample, clean_images[:, :args.num_images, :, :, :]], axis=1)
+            context_frames = clean_images[:, :args.num_images, :, :, :]
+            probability = torch.from_numpy(np.random.rand(B))
+            context_frames[torch.where(probability < args.p_unconditional)] = 0.0
+
+            model_inputs = torch.cat([noisy_sample, context_frames], axis=1)
             model_inputs = model_inputs.reshape(B, -1, H, W)
 
-            image_preprocessor_input = clean_images[:, :args.num_images, ...].reshape(B*T, C, H, W)
-            image_preprocessed = feature_extractor(images=image_preprocessor_input, return_tensors="pt").pixel_values
 
-            print("Image preprocessed shape", image_preprocessed.shape)
+            # TODO: needs to be manually adjusted for grayscale vs rgb
+
+            ###################### grayscale ###########################################################################
+            if args.data_format == "rgbd":
+                image_preprocessor_input = clean_images[:, :args.num_images, ...].reshape(B*args.num_images*C, 1, H, W)
+            else:
+                image_preprocessor_input = clean_images[:, :args.num_images, ...].reshape(B*args.num_images, C, H, W)
+            image_preprocessor_input = image_preprocessor_input / 2 + 0.5
+            device = image_preprocessor_input.device
+            image_preprocessor_input = image_preprocessor_input.repeat(1, 3, 1, 1).float().cpu().numpy()
+            ############################################################################################################
+
+            ########################3 colored ##########################################################################
+            """
+            if "d" in args.data_format:
+                image_preprocessor_input_depth = clean_images[:, :args.num_images, -1:, ...].reshape(B, args.num_images, 1, 1, H, W).repeat(1, 1, 1, 3, 1, 1)
+            if "rgb" in args.data_format:
+                image_preprocessor_input_rgb   = clean_images[:, :args.num_images, :3, ...].reshape(B, args.num_images, 1, 3, H, W)
+            if args.data_format == "d":
+                image_preprocessor_input = image_preprocessor_input_depth.reshape(-1, 3, H, W)
+            elif args.data_format == "rgb":
+                image_preprocessor_input = image_preprocessor_input_rgb.reshape(-1, 3, H, W)
+            else:
+                image_preprocessor_input = torch.cat([image_preprocessor_input_depth, image_preprocessor_input_rgb], dim=-4).reshape(-1, 3, H, W)
+            image_preprocessor_input = image_preprocessor_input / 2 + 0.5
+            device = image_preprocessor_input.device
+            image_preprocessor_input = image_preprocessor_input.float().cpu().numpy()
+            """
+            ############################################################################################################
+
+            image_resized = [feature_extractor.resize(image=image, size={"shortest_edge": 224}, resample=PIL.Image.BICUBIC, input_data_format="channels_first") for image in image_preprocessor_input]
+            image_resized = np.stack(image_resized, axis=0)
+            image_preprocessed = (image_resized - 0.5) / 0.5
+            image_preprocessed = torch.from_numpy(image_preprocessed).to(device)
+            # print("1", 4096 - torch.sum(torch.isfinite(image_preprocessor_input)), torch.unique(image_preprocessed)[:5], torch.unique(image_preprocessed)[-5:])
 
             dtype = next(image_encoder.parameters()).dtype
             image_preprocessed = image_preprocessed.to(device=accelerator.device, dtype=dtype)
             image_embeddings = image_encoder(image_preprocessed).image_embeds
-            print("Image embeddings shape", image_embeddings.shape)
-            image_embeddings = image_embeddings.unsqueeze(1)
-            print("Image embeddings shape after", image_embeddings.shape)
+            image_embeddings = image_embeddings.unsqueeze(1)  # N x 1 x 768
+            image_embeddings = image_embeddings.reshape(B, args.num_images, C, -1).reshape(B, args.num_images, -1)
+            # print("2", torch.unique(image_embeddings)[:5], torch.unique(image_embeddings)[-5:])
 
-            probability = np.random.rand(B)
             image_embeddings[torch.where(probability < args.p_unconditional)] = 0.0
             rendering_poses[torch.where(probability < args.p_unconditional)] = 0.0
 
@@ -912,6 +998,7 @@ def main(args):
                         plt.show()
 
                 loss = loss_2d
+
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:

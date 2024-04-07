@@ -427,7 +427,7 @@ def main(args):
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.logger,
-        logging_dir=logging_dir,
+        project_dir=logging_dir,
         project_config=accelerator_project_config,
         # kwargs_handlers=[ddp_kwargs]
     )
@@ -546,6 +546,7 @@ def main(args):
                 up_block_types=up_block_types,
             )
         else:
+            """
             model = UNetModel(
                 sample_size=args.resolution,
                 in_channels=args.in_channels,
@@ -566,7 +567,7 @@ def main(args):
                 norm_num_groups=32
             )
             """
-            # st = torch.load("diffusion_pytorch_model.bin")
+            st = torch.load("stable_diffusion_unet.bin")
             model = UNetModel(
                 sample_size=args.resolution,
                 in_channels=args.in_channels,
@@ -591,7 +592,6 @@ def main(args):
                     else:
                         params.data = st[f'{name}']
                         # params.requires_grad = False
-            """
     else:
         config = UNetModel.load_config(args.model_config_name_or_path)
         model = UNetModel.from_config(config)

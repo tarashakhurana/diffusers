@@ -17,6 +17,8 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import numpy as np
+import PIL
+from matplotlib import pyplot as plt
 
 from ...utils import randn_tensor
 from ..pipeline_utils import DiffusionPipeline, ImagePipelineOutput
@@ -55,6 +57,7 @@ class DDPMImg2ImgCLIPPosePipeline(DiffusionPipeline):
         inpainting_image: Union[torch.cuda.FloatTensor, Tuple],
         batch_size: int = 1,
         guidance: float = 1.0,
+        mix_guidance: float = 1.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         num_inference_steps: int = 1000,
         output_type: Optional[str] = "pil",
@@ -129,28 +132,63 @@ class DDPMImg2ImgCLIPPosePipeline(DiffusionPipeline):
         clean_images = inpainting_image[0][:, :-1, :, :, :]
         B, T, C, H, W = clean_images.shape
 
-        image_preprocessor_input = clean_images.reshape(B*T, C, H, W)
-        image_preprocessed = self.feature_extractor(images=image_preprocessor_input, return_tensors="pt").pixel_values
+        # TODO: needs to be manually adjusted for grayscale vs rgb
 
-        print("Image preprocessed shape", image_preprocessed.shape)
+        ###################### grayscale ###########################################################################
+        if self.data_format == "rgbd":
+            image_preprocessor_input = clean_images[:, :T, ...].reshape(B*T*C, 1, H, W)
+        else:
+            image_preprocessor_input = clean_images[:, :T, ...].reshape(B*T, C, H, W)
+        image_preprocessor_input = image_preprocessor_input / 2 + 0.5
+        device = image_preprocessor_input.device
+        image_preprocessor_input = image_preprocessor_input.repeat(1, 3, 1, 1).float().cpu().numpy()
+        ############################################################################################################
+
+        ########################3 colored ##########################################################################
+        """
+        if "d" in self.data_format:
+            image_preprocessor_input_depth = clean_images[:, :, -1:, ...].reshape(B, T, 1, 1, H, W).repeat(1, 1, 1, 3, 1, 1)
+        if "rgb" in self.data_format:
+            image_preprocessor_input_rgb   = clean_images[:, :, :3, ...].reshape(B, T, 1, 3, H, W)
+        if self.data_format == "d":
+            image_preprocessor_input = image_preprocessor_input_depth.reshape(-1, 3, H, W)
+        elif self.data_format == "rgb":
+            image_preprocessor_input = image_preprocessor_input_rgb.reshape(-1, 3, H, W)
+        else:
+            image_preprocessor_input = torch.cat([image_preprocessor_input_depth, image_preprocessor_input_rgb], dim=-4).reshape(-1, 3, H, W)
+        image_preprocessor_input = image_preprocessor_input / 2 + 0.5
+        device = image_preprocessor_input.device
+        image_preprocessor_input = image_preprocessor_input.float().cpu().numpy()
+        """
+        ############################################################################################################
+
+        image_resized = [self.feature_extractor.resize(image=image, size={"shortest_edge": 224}, resample=PIL.Image.BICUBIC, input_data_format="channels_first") for image in image_preprocessor_input]
+        image_resized = np.stack(image_resized, axis=0)
+        image_preprocessed = (image_resized - 0.5) / 0.5
+        image_preprocessed = torch.from_numpy(image_preprocessed).to(device)
+        print("image preprocessed shape", image_preprocessed.shape)
 
         dtype = next(self.image_encoder.parameters()).dtype
-        image_preprocessed = image_preprocessed.to(device=self.device, dtype=dtype)
+        image_preprocessed = image_preprocessed.to(device=device, dtype=dtype)
         image_embeddings = self.image_encoder(image_preprocessed).image_embeds
-        print("Image embeddings shape", image_embeddings.shape)
-        image_embeddings = image_embeddings.unsqueeze(1)
-        print("Image embeddings shape after", image_embeddings.shape)
+        image_embeddings = image_embeddings.unsqueeze(1)  # N x 1 x 768
+        image_embeddings = image_embeddings.reshape(B, T, C, -1).reshape(B, T, -1)
+        print("final shape of image embeddings", image_embeddings.shape)
 
         if self.use_rendering:
             assert self.train_with_plucker_coords
             rendering_poses = inpainting_image[1]
 
         clean_images = clean_images.reshape(B, -1, H, W)
+        i = 0
 
         for t in self.progress_bar(self.scheduler.timesteps):
             # 0. prepare the model inputs
             # choose the type of masking strategy
             # remember that both the clean and noisy images are 5D tensors now
+            if batch_size != B:
+                image = torch.cat([image] * 2)
+
             model_inputs = torch.cat([image, clean_images], axis=1)
 
             if do_classifier_free_guidance:
@@ -173,8 +211,22 @@ class DDPMImg2ImgCLIPPosePipeline(DiffusionPipeline):
                 model_output_uncond, model_output_cond = model_output.chunk(2)
                 model_output = model_output_uncond + guidance * (model_output_cond - model_output_uncond)
 
+            if batch_size != B:
+                jump, autoregressive = model_output.chunk(2)
+                model_output = autoregressive + mix_guidance * (jump - autoregressive)
+                image, _ = image.chunk(2)
+
             # 2. compute previous image: x_t -> x_t-1
-            image = self.scheduler.step(model_output, t, image).prev_sample  # , generator=generator).prev_sample
+            scheduler_output = self.scheduler.step(model_output, t, image)  # , generator=generator).prev_sample
+            image = scheduler_output.prev_sample
+            im = scheduler_output.pred_original_sample
+
+            # im = (im / 2 + 0.5).clamp(0, 1)
+            # im = im.cpu().permute(0, 2, 3, 1).numpy()
+            # plt.imsave(f'/data3/tkhurana/diffusers/logs/x{i}_firstiter.png', im[0, :, :, 0])
+
+            i += 1
+
 
         image = (image / 2 + 0.5).clamp(0, 1)
         image = image.cpu().permute(0, 2, 3, 1).numpy()

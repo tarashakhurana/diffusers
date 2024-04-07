@@ -315,12 +315,13 @@ class UNet2DConditionSpacetimeRenderModel(ModelMixin, ConfigMixin, UNet2DConditi
         self.frame_proj = Timesteps(block_out_channels[0], flip_sin_to_cos, freq_shift)
         self.frame_embedding = TimestepEmbedding(
                 block_out_channels[0],
-                block_out_channels[0] * 4,
+                block_out_channels[0] * 2,
                 act_fn=act_fn,
                 post_act_fn=timestep_post_act,
                 cond_proj_dim=time_cond_proj_dim)
 
         self.conditioning_compressor = nn.Linear(cross_attention_dim_pre, cross_attention_dim)
+        self.pool_clip_features = nn.Linear(3, 1)
 
         # class embedding
         if class_embed_type is None and num_class_embeds is not None:
@@ -772,8 +773,13 @@ class UNet2DConditionSpacetimeRenderModel(ModelMixin, ConfigMixin, UNet2DConditi
         time_conditioning = torch.stack([self.frame_proj(encoder_hidden_states[1][b, :, 0]) for b in range(encoder_hidden_states[1].shape[0])], axis=0)
         time_conditioning = time_conditioning.to(dtype=sample.dtype)
         time_conditioning = self.frame_embedding(time_conditioning)
+        clip_features = encoder_hidden_states[0].transpose(1, 2)
+        pooled_features = self.pool_clip_features(clip_features)
+        video_features = torch.cat([clip_features, pooled_features], axis=-1)
+        video_features = video_features.transpose(1, 2)
 
-        encoder_hidden_states = torch.cat([encoder_hidden_states[0], time_conditioning], axis=-2)
+        encoder_hidden_states = torch.cat([video_features, time_conditioning], axis=-1)
+        encoder_hidden_states = self.conditioning_compressor(encoder_hidden_states)
 
         if do_classifier_free_guidance:
             negative_prompt_embeds = torch.zeros_like(encoder_hidden_states)
@@ -782,7 +788,6 @@ class UNet2DConditionSpacetimeRenderModel(ModelMixin, ConfigMixin, UNet2DConditi
             # Here we concatenate the unconditional and text embeddings into a single batch
             # to avoid doing two forward passes
             encoder_hidden_states = torch.cat([negative_prompt_embeds, encoder_hidden_states])
-
 
         """
         encoder_hidden_states_downblock = [hs[:, input_indices, ...] for hs in encoder_hidden_states]
@@ -927,6 +932,7 @@ class UNet2DConditionSpacetimeRenderModel(ModelMixin, ConfigMixin, UNet2DConditi
 
         # 2. pre-process
         sample = self.conv_in_render(sample)
+        sample = self.conv_in(sample)
 
         # 2.5 GLIGEN position net
         if cross_attention_kwargs is not None and cross_attention_kwargs.get("gligen", None) is not None:
@@ -1028,6 +1034,7 @@ class UNet2DConditionSpacetimeRenderModel(ModelMixin, ConfigMixin, UNet2DConditi
         if self.conv_norm_out:
             sample = self.conv_norm_out(sample)
             sample = self.conv_act(sample)
+        sample = self.conv_out(sample)
         sample = self.conv_out_render(sample)
 
         if not return_dict:
