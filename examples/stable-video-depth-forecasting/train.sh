@@ -1,4 +1,4 @@
-accelerate launch train_svd.py \
+accelerate launch train.py \
     --pretrained_model_name_or_path="stabilityai/stable-video-diffusion-img2vid-xt" \
     --per_gpu_batch_size=1 --gradient_accumulation_steps=1 \
     --max_train_steps=50000 \
@@ -8,4 +8,5 @@ accelerate launch train_svd.py \
     --learning_rate=1e-5 --lr_warmup_steps=0 \
     --seed=123 \
     --mixed_precision="fp16" \
-    --validation_steps=200
+    --validation_steps=200000000000000000000 \
+    --per_gpu_batch_size=2

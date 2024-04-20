@@ -55,7 +55,7 @@ from diffusers.utils.import_utils import is_xformers_available
 
 from torch.utils.data import Dataset
 
-from data import TAOMAEDataset
+from data import TAOMAEDataset, TAOForecastingDataset
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.24.0.dev0")
@@ -786,13 +786,14 @@ def main():
     # DataLoaders creation:
     args.global_batch_size = args.per_gpu_batch_size * accelerator.num_processes
 
-    train_dataset = TAOMAEDataset(
+    train_dataset = TAOForecastingDataset(
         instance_data_root="/data/tkhurana/TAO-depth/zoe/frames/val/",
         size=320,
         center_crop=False,
-        num_images=14,
-        fps=15,
-        horizon=2,
+        num_images=3,
+        fps=30,
+        offset=15,
+        horizon=7,
         load_rgb=False,
         rgb_data_root="/data3/chengyeh/TAO/frames/val/",
         split="train",
@@ -1098,7 +1099,7 @@ def main():
                     # sample images!
                     if (
                         (global_step % args.validation_steps == 0)
-                        or (global_step == 1)
+                        and (global_step != 1)
                     ):
                         logger.info(
                             f"Running validation... \n Generating {args.num_validation_images} videos."
