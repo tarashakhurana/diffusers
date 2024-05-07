@@ -89,6 +89,7 @@ class UNetSpatioTemporalConditionModel(ModelMixin, ConfigMixin, UNet2DConditionL
         addition_time_embed_dim: int = 256,
         projection_class_embeddings_input_dim: int = 768,
         layers_per_block: Union[int, Tuple[int]] = 2,
+        cross_attention_dim_pre: Union[int, Tuple[int]] = 1056,
         cross_attention_dim: Union[int, Tuple[int]] = 1024,
         transformer_layers_per_block: Union[int, Tuple[int], Tuple[Tuple]] = 1,
         num_attention_heads: Union[int, Tuple[int]] = (5, 10, 20, 20),
@@ -142,6 +143,10 @@ class UNetSpatioTemporalConditionModel(ModelMixin, ConfigMixin, UNet2DConditionL
 
         self.add_time_proj = Timesteps(addition_time_embed_dim, True, downscale_freq_shift=0)
         self.add_embedding = TimestepEmbedding(projection_class_embeddings_input_dim, time_embed_dim)
+
+        self.timestamp_proj = Timesteps(16, True, downscale_freq_shift=0)
+        self.timestamp_embedding = TimestepEmbedding(16, 16)
+        self.conditioning_compressor = nn.Linear(cross_attention_dim_pre, cross_attention_dim)
 
         self.down_blocks = nn.ModuleList([])
         self.up_blocks = nn.ModuleList([])
@@ -358,7 +363,7 @@ class UNetSpatioTemporalConditionModel(ModelMixin, ConfigMixin, UNet2DConditionL
         self,
         sample: torch.FloatTensor,
         timestep: Union[torch.Tensor, float, int],
-        encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states: Union[torch.Tensor, Tuple],
         added_time_ids: torch.Tensor,
         return_dict: bool = True,
     ) -> Union[UNetSpatioTemporalConditionOutput, Tuple]:
@@ -369,8 +374,11 @@ class UNetSpatioTemporalConditionModel(ModelMixin, ConfigMixin, UNet2DConditionL
             sample (`torch.FloatTensor`):
                 The noisy input tensor with the following shape `(batch, num_frames, channel, height, width)`.
             timestep (`torch.FloatTensor` or `float` or `int`): The number of timesteps to denoise an input.
-            encoder_hidden_states (`torch.FloatTensor`):
-                The encoder hidden states with shape `(batch, sequence_length, cross_attention_dim)`.
+            encoder_hidden_states (`torch.FloatTensor` or `Tuple`)
+                The encoder hidden states with shape `(batch, sequence_length, cross_attention_dim)`. Or, a tuple of
+                (CLIP embeddings, timestamps, camera poses): in which case CLIP embeddings are of shape
+                `(batch_size, num_frames, cross_attention_dim)`, timestamps are of shape `(batch_size, num_frames, 1)`,
+                and camera poses are of shape, `(batch_size, num_frames, 16)`.
             added_time_ids: (`torch.FloatTensor`):
                 The additional time ids with shape `(batch, num_additional_ids)`. These are encoded with sinusoidal
                 embeddings and added to the time embeddings.
@@ -421,8 +429,20 @@ class UNetSpatioTemporalConditionModel(ModelMixin, ConfigMixin, UNet2DConditionL
         # Repeat the embeddings num_video_frames times
         # emb: [batch, channels] -> [batch * frames, channels]
         emb = emb.repeat_interleave(num_frames, dim=0)
-        # encoder_hidden_states: [batch, 1, channels] -> [batch * frames, 1, channels]
-        encoder_hidden_states = encoder_hidden_states.repeat_interleave(num_frames, dim=0)
+
+        # prepare the encoder hidden states
+        clip_embeddings, timestamps, camera_poses = encoder_hidden_states
+        print("clip_embeddings.shape", clip_embeddings.shape)
+        print("timestamps.shape", timestamps.shape)
+        print("camera_poses.shape", camera_poses.shape)
+        timestamp_conditioning = torch.stack([self.timestamp_proj(timestamps[b, :, 0]) for b in range(timestamps.shape[0])], axis=0)
+        timestamp_conditioning = self.timestamp_embedding(timestamp_conditioning.to(sample.dtype))
+
+        encoder_hidden_states = torch.cat([clip_embeddings, timestamp_conditioning, camera_poses], axis=-1)
+        encoder_hidden_states = self.conditioning_compressor(encoder_hidden_states)
+
+        # encoder_hidden_states: [batch, frames, channels] -> [batch * frames, 1, channels]
+        encoder_hidden_states = encoder_hidden_states.reshape(batch_size * num_frames, 1, -1)
 
         # 2. pre-process
         sample = self.conv_in(sample)

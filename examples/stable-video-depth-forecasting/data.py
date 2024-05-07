@@ -952,6 +952,180 @@ class TAOForecastingDataset(Dataset):
         return example
 
 
+class DeformingThings4DDataset(Dataset):
+    """
+    A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
+    It pre-processes the images and the tokenizes prompts.
+    """
+
+    def __init__(
+        self,
+        instance_data_root,
+        size=256,
+        num_images=25,
+        split="train",
+        ext=["png"],
+        horizon=1,
+        center_crop=True,
+        window_horizon=0.5,
+        fps=30,
+        normalization_factor=20480.0,
+        visualize=False,
+    ):
+        self.size = size
+        self.center_crop = center_crop
+        self.num_images = num_images
+        self.split = split
+        self.fps = fps
+        self.horizon = horizon
+        self.window_horizon = window_horizon
+        self.visualize = visualize
+        self.normalization_factor = normalization_factor
+
+        self.instance_data_root = Path(instance_data_root)
+        if not self.instance_data_root.exists():
+            raise ValueError(f"Instance {self.instance_data_root} images root doesn't exists.")
+
+        # NOTE:
+        self.sequences = []
+        self.filenames = []
+        self.valid_indices = []
+        all_frames = []
+        seq_to_frames = {}
+        self.seq_to_startend = {}
+
+        for e in ext:
+            all_frames.extend(sorted(list(self.instance_data_root.rglob(f"*.{e}"))))
+
+        all_frames = list(all_frames)
+
+        self.paths = all_frames
+        for frame in all_frames:
+            seq = str(frame)[len(str(self.instance_data_root)) + 1:str(frame).rfind("/")]
+            if seq not in seq_to_frames:
+                seq_to_frames[seq] = []
+            seq_to_frames[seq].append(frame)
+
+        print("found sequences", seq_to_frames.keys())
+
+        for seq in seq_to_frames.keys():
+
+            valid_fps = self.fps
+            frames = seq_to_frames[seq]
+            start_index = len(self.filenames)
+
+            for idx in range(0, len(frames)):
+                frame_path = frames[idx]
+                self.sequences.append(seq)
+                self.filenames.append(frame_path)
+
+            #
+            end_index = len(self.filenames)
+            #
+            if self.split == "train":
+                valid_start_index = start_index + self.horizon * valid_fps
+                valid_end_index = end_index - self.horizon * valid_fps
+            elif self.split == "val":
+                valid_start_index = np.random.choice(
+                        np.arange(
+                            start_index + self.horizon * valid_fps,
+                            end_index - self.horizon * valid_fps),
+                        size=(1,),
+                        replace=False
+                    )[0]
+                valid_end_index = valid_start_index + 1
+
+            self.seq_to_startend[seq] = (valid_start_index, valid_end_index)
+            self.valid_indices += list(range(valid_start_index, valid_end_index, int(self.window_horizon * valid_fps)))
+
+        self.num_instance_images = len(self.valid_indices)
+        self._length = self.num_instance_images
+
+        print("found length to be", self._length)
+
+        self.image_transforms = transforms.Compose(
+            [
+                transforms.Resize(size, interpolation=transforms.InterpolationMode.NEAREST),
+                transforms.CenterCrop(size),
+                transforms.ToTensor(),
+                # brings the training data between -1 and 1
+                transforms.Normalize([0.5], [0.5]),
+            ]
+        )
+
+    def __len__(self):
+        return self._length
+
+    def __getitem__(self, index):
+        example = {}
+        ref_index = self.valid_indices[index]
+        ref_seq = self.sequences[ref_index]
+        ref_start = self.seq_to_startend[ref_seq][0]
+        ref_end = self.seq_to_startend[ref_seq][1]
+        valid_fps = self.fps
+        query_index = np.random.choice(
+                np.arange(
+                    max(ref_start - self.horizon * valid_fps, ref_index - self.horizon * valid_fps),
+                    min(ref_end + self.horizon * valid_fps, ref_index + self.horizon * valid_fps)),
+                size=(self.num_images + 1,),
+                replace=False)
+        input_index = query_index
+        depth_frames = []
+        all_filenames = []
+        index_labels = []
+        extrinsics = []
+
+        ref_c2w = np.loadtxt(str(self.filenames[ref_index])[:-4].replace("depth", "extrinsics") + ".txt")
+
+        for i in input_index:
+            query_index = int(i)
+
+            all_filenames.append(self.filenames[query_index])
+
+            curr_seq = self.sequences[query_index]
+            assert ref_seq == curr_seq
+
+            ############################## load depth image ###################
+            depth = cv2.imread(str(self.filenames[query_index]), cv2.IMREAD_ANYDEPTH)
+            depth = depth.astype(np.float32) / self.normalization_factor
+            depth = (depth - depth.min()) / (depth.max() - depth.min()) * 255.0
+            depth_preprocessed = self.image_transforms(Image.fromarray(depth.astype("uint8"))).squeeze()
+            depth_frames.append(depth_preprocessed)
+
+            ############ get normalized timestamps ############################
+            index_list = np.arange(self.num_images + 1)
+            blah = random.choice(index_list)
+            index_label = torch.Tensor([i - input_index[self.num_images-1]]) / self.fps
+            # index_label = torch.Tensor([i - input_index[blah]]) / self.fps
+            # index_label = torch.Tensor([i]) / self.fps
+            index_labels.append(index_label)
+
+            ############################## get camera extrinsics ##############
+            curr_c2w = np.loadtxt(str(self.filenames[query_index])[:-4].replace("depth", "extrinsics") + ".txt")
+            rel_c2w = np.linalg.inv(ref_c2w) @ curr_c2w
+            extrinsics.append(rel_c2w)
+
+        depth_video = torch.stack(depth_frames, axis=0)
+        timestamps = torch.stack(index_labels, axis=0)
+        extrinsics = torch.stack(extrinsics, axis=0)
+
+        if self.visualize:
+            fig = plt.figure()
+            for j in range(self.num_images+1):
+                plt.subplot(1, self.num_images+1, j+1)
+                plt.imshow(depth_video[j].numpy())
+                plt.title(str(label_video[j]))
+            plt.show()
+
+        example["pixel_values"] = depth_video  # video is of shape T x H x W or T x C x H x W
+        print("shape of pixel values", depth_video.shape)
+        example["filenames"] = all_filenames
+        example["timestamps"] = timestamps
+        example["extrinsics"] = extrinsics
+
+        return example
+
+
 if __name__ == "__main__":
     dataset = TAOMAEDataset(
         instance_data_root="/data/tkhurana/TAO-depth/zoe/frames/val/",
