@@ -33,208 +33,6 @@ from scipy.interpolate import interpn
 
 import utils
 
-class TAODepthDataset(Dataset):
-    """
-    A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
-    It pre-processes the images and the tokenizes prompts.
-    """
-
-    def __init__(
-        self,
-        instance_data_root,
-        size=256,
-        num_images=3,
-        offset=15,
-        ext=["png"],
-        center_crop=True,
-    ):
-        self.size = size
-        self.offset = offset
-        self.center_crop = center_crop
-        self.num_images = num_images
-        self.sequence = num_images > 1
-
-        self.instance_data_root = Path(instance_data_root)
-        if not self.instance_data_root.exists():
-            raise ValueError(f"Instance {self.instance_data_root} images root doesn't exists.")
-
-        # NOTE:
-        self.sequences = []
-        self.filenames = []
-        self.valid_indices = []
-        all_frames = []
-        seq_to_frames = {}
-
-        for e in ext:
-            all_frames.extend(sorted(list(self.instance_data_root.rglob(f"*.{e}"))))
-
-        all_frames = list(all_frames)
-
-        self.paths = all_frames
-
-        if self.sequence:
-            for frame in all_frames:
-                seq = str(frame)[len(str(self.instance_data_root)):str(frame).rfind("/")]
-                if seq not in seq_to_frames:
-                    seq_to_frames[seq] = []
-                seq_to_frames[seq].append(frame)
-
-            for seq in seq_to_frames:
-                frames = seq_to_frames[seq]
-                start_index = len(self.filenames)
-
-                for idx in range(0, len(frames), self.offset):
-                    frame_path = frames[idx]
-                    self.sequences.append(seq)
-                    self.filenames.append(frame_path)
-
-                #
-                end_index = len(self.filenames)
-                #
-                valid_start_index = start_index + self.num_images # (self.n_input // 10)
-                valid_end_index = end_index
-                self.valid_indices += list(range(valid_start_index, valid_end_index))
-        self.num_instance_images = len(self.valid_indices)
-        self._length = self.num_instance_images
-
-        print("found length to be", self._length)
-
-        self.image_transforms = transforms.Compose(
-            [
-                transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
-                transforms.CenterCrop(size),
-                transforms.ToTensor(),
-                transforms.Normalize([0.5], [0.5]),
-            ]
-        )
-
-    def __len__(self):
-        return self._length
-
-    def __getitem__(self, index):
-        example = {}
-        ref_index = self.valid_indices[index]
-        depth_frames = []
-
-        for i in range(self.num_images):
-            depth = Image.open(self.filenames[ref_index - i])
-            depth = np.array(depth) / (256.0 * 80.0)
-            depth = (depth - depth.min()) / (depth.max() - depth.min()) * 255.0
-            depth_frames.append(self.image_transforms(Image.fromarray(depth.astype("uint8"))).squeeze())
-
-        depth_video = torch.stack(depth_frames, axis=0)
-
-        example["input"] = depth_video
-        return example
-
-
-class PointOdysseyDepthDataset(Dataset):
-    """
-    A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
-    It pre-processes the images and the tokenizes prompts.
-    """
-
-    def __init__(
-        self,
-        instance_data_root,
-        size=256,
-        num_images=3,
-        offset=15,
-        ext=["png"],
-        center_crop=True,
-        normalization_factor=20480.0
-    ):
-        self.size = size
-        self.offset = offset
-        self.center_crop = center_crop
-        self.num_images = num_images
-        self.normalization_factor = normalization_factor
-        self.sequence = num_images > 1
-
-        self.instance_data_root = Path(instance_data_root)
-        if not self.instance_data_root.exists():
-            raise ValueError(f"Instance {self.instance_data_root} images root doesn't exists.")
-
-        # NOTE:
-        self.sequences = []
-        self.filenames = []
-        self.valid_indices = []
-        all_frames = []
-        seq_to_frames = {}
-
-        if "pointodyssey" in str(self.instance_data_root):
-            for e in ext:
-                all_frames.extend(sorted(list(self.instance_data_root.rglob(f"*/depths/depth_*.{e}"))))
-        else:
-            for e in ext:
-                all_frames.extend(sorted(list(self.instance_data_root.rglob(f"*.{e}"))))
-
-        all_frames = list(all_frames)
-
-        self.paths = all_frames
-
-        if self.sequence:
-            for frame in all_frames:
-                seq = str(frame)[len(str(self.instance_data_root)):str(frame).rfind("/")]
-                if seq not in seq_to_frames:
-                    seq_to_frames[seq] = []
-                seq_to_frames[seq].append(frame)
-
-            for seq in seq_to_frames:
-                frames = seq_to_frames[seq]
-                start_index = len(self.filenames)
-
-                for idx in range(0, len(frames), self.offset):
-                    frame_path = frames[idx]
-                    self.sequences.append(seq)
-                    self.filenames.append(frame_path)
-
-                #
-                end_index = len(self.filenames)
-                #
-                valid_start_index = start_index + self.num_images # (self.n_input // 10)
-                valid_end_index = end_index
-                self.valid_indices += list(range(valid_start_index, valid_end_index))
-        self.num_instance_images = len(self.valid_indices)
-        self._length = self.num_instance_images
-
-        print("found length to be", self._length)
-
-        self.image_transforms = transforms.Compose(
-            [
-                transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
-                transforms.CenterCrop(size),
-                transforms.ToTensor(),
-                transforms.Normalize([0.5], [0.5]),
-            ]
-        )
-
-    def __len__(self):
-        return self._length
-
-    def __getitem__(self, index):
-        example = {}
-        ref_index = self.valid_indices[index]
-        depth_frames = []
-
-        for i in range(self.num_images):
-            depth = Image.open(self.filenames[ref_index - i])
-            depth = np.array(depth).astype(np.float32) / self.normalization_factor
-
-            if "pointodyssey" in str(self.filenames[ref_index - i]):
-                depth = np.where(depth > 100.0, 100.0, depth)
-                depth = depth / 100.0
-
-            # just to be sure, clip away all values beyond the range of 0-1
-            depth = np.clip(depth, 0, 1)
-            depth = depth * 255.0
-            depth_frames.append(self.image_transforms(Image.fromarray(depth.astype("uint8"))).squeeze())
-
-        depth_video = torch.stack(depth_frames, axis=0)
-
-        example["input"] = depth_video
-        return example
-
 
 def collate_fn_depthpose(examples):
     inputs = torch.stack([example["input"] for example in examples])
@@ -295,38 +93,6 @@ def collate_fn_depthpose(examples):
         # "image_plane_in_cam": image_plane_in_cam,
         # "Rt": Rt,
         "filenames": filenames
-    }
-
-
-def collate_fn_temporalsuperres(examples):
-    inputs = torch.stack([example["input"] for example in examples])
-    inputs = inputs.to(memory_format=torch.contiguous_format).float()
-    inputs = inputs.squeeze(0)
-
-    plucker_coords = torch.stack([example["plucker_coords"] for example in examples])
-    plucker_coords = plucker_coords.to(memory_format=torch.contiguous_format).float()
-    plucker_coords = plucker_coords.squeeze(0)
-
-    indices = torch.stack([example["indices"] for example in examples])
-    indices = indices.to(memory_format=torch.contiguous_format).float()
-    indices = indices.squeeze(0)
-
-    filenames = [example["filenames"] for example in examples][0]
-
-    return {
-        "input": inputs,
-        "plucker_coords": plucker_coords,
-        "filenames": filenames,
-        "indices": indices
-    }
-
-
-def collate_fn_inpainting(examples):
-    inputs = torch.stack([example["input"] for example in examples])
-    inputs = inputs.to(memory_format=torch.contiguous_format).float()
-
-    return {
-        "input": inputs
     }
 
 
@@ -623,10 +389,9 @@ class TAOMAEDataset(Dataset):
                         plt.title(str(label_video[j]))
                 plt.show()
 
-        example["pixel_values"] = depth_video  # video is of shape T x H x W or T x C x H x W
-        print("shape of pixel values", depth_video.shape)
-        example["filenames"] = all_filenames
-        example["plucker_coords"] = label_video
+        example["pixel_values"] = torch.stack([depth_video] * 3, axis=1)  # video is of shape T x H x W or T x C x H x W
+        # example["filenames"] = all_filenames
+        # example["plucker_coords"] = label_video
         if self.interpolation_baseline:
             example["interp_depth"] = interp_depth
         if self.load_rgb:
@@ -845,7 +610,7 @@ class TAOForecastingDataset(Dataset):
 
         # take 3 images from the past + a future image
         ####### change future timestep to self.num_images + 1 for evaluation
-        for i in list(range(self.num_images)) + [self.num_images + k for k in range(1, 20, 2)]:
+        for i in list(range(self.num_images)) + [self.num_images + k for k in range(1, 12)]:
             query_index = int(ref_index - self.num_images + i + 1)
 
             all_filenames.append(self.filenames[query_index])
@@ -941,9 +706,9 @@ class TAOForecastingDataset(Dataset):
                         plt.title(str(label_video[j]))
                 plt.show()
 
-        example["input"] = depth_video  # video is of shape T x H x W or T x C x H x W
-        example["filenames"] = all_filenames
-        example["plucker_coords"] = label_video.unsqueeze(-1)
+        example["pixel_values"] = torch.stack([depth_video] * 3, axis=1)  # video is of shape T x H x W or T x C x H x W
+        # example["filenames"] = all_filenames
+        # example["plucker_coords"] = label_video.unsqueeze(-1)
         if self.interpolation_baseline:
             example["interp_depth"] = torch.from_numpy(interp_depth).unsqueeze(0)
         if self.load_rgb:
